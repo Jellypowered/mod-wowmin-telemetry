@@ -1,0 +1,19 @@
+#
+# Copyright (C) 2026 WoWMin contributors, released under the MIT license.
+#
+
+[worldserver]
+
+########################################
+# WoWMin telemetry
+########################################
+#
+#    WowMinTelemetry.Enable
+#        Description: Enables the administrator-only "wowmin telemetry" command.
+#                     The command exposes live in-memory player state through the
+#                     existing authenticated worldserver command transport.
+#        Default:     0 - Disabled
+#                     1 - Enabled
+#
+
+WowMinTelemetry.Enable = 0
