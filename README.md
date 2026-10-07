@@ -20,7 +20,7 @@ reduce the snapshot to a map or one runtime instance.
 The response protocol is line-oriented and versioned:
 
 ```text
-WMAP_VERSION|6
+WMAP_VERSION|7
 WMAP|name|mapId|instanceId|x|y|z|orientation|level|race|class|accountId|isBot|alive|inCombat|mapType|difficulty|sessionStartedAt|groupId|isRaidGroup|subgroup|teamId|healthPct|powerType|powerPct|targetGuid|targetType|targetName|roleMask|waitingForResurrect|battlegroundRole|wmoGroupId|gender|stateFlags
 WBG|mapId|instanceId|battlegroundTypeId|status|elapsedMs|remainingMs|winner|allianceScore|hordeScore|alliancePlayers|hordePlayers|allianceAlive|hordeAlive|nextResurrectMs|allianceStrategy|hordeStrategy
 WOBJ|mapId|instanceId|worldStateId|value
@@ -31,8 +31,10 @@ WEVENT|mapId|instanceId|eventId|occurredAt|type|actorGuid|actorName|targetGuid|t
 WMAP_END|playerCount|battlegroundCount|worldStateCount|instanceCount|bossCount|deathCount|eventCount
 ```
 
-Version 6 adds gender plus a compact player-state bitmask: taxi flight (`1`), mounted (`2`), sapped (`4`),
-stunned (`8`), and Spirit of Redemption form (`16`). The existing `alive`, `inCombat`, and
+Version 7 adds authoritative battleground flag-carrier state (`32`) while a player holds the Warsong,
+Silverwing, or Netherstorm flag aura. The bit clears with the aura when the flag is dropped, captured,
+returned, or lost on death. Version 6 adds gender plus a compact player-state bitmask: taxi flight (`1`),
+mounted (`2`), sapped (`4`), stunned (`8`), and Spirit of Redemption form (`16`). The existing `alive`, `inCombat`, and
 `waitingForResurrect` fields remain authoritative for death, combat, and resurrection indicators.
 Version 5 adds bounded, server-owned event IDs for participant kills, looted items, and level-ups.
 Kill credit follows the player owner of pets and controlled units; loot events include item ID, name,
@@ -73,7 +75,7 @@ The module is disabled by default. No database changes are required.
 WoWMin should request `wowmin telemetry`, validate the `WMAP_VERSION` line, and verify that the
 `WMAP_END` player, battleground, world-state, instance, boss, death, and event counts match parsed
 rows. Database coordinates remain a fallback when the command is disabled or unavailable. WoWMin
-retains parsers for legacy responses and protocol versions 1–5 so the service and module can be deployed in
+retains parsers for legacy responses and protocol versions 1–6 so the service and module can be deployed in
 either order.
 
 ## License

@@ -79,7 +79,11 @@ enum PlayerStateFlags : uint32
     PLAYER_STATE_SAPPED = 1 << 2,
     PLAYER_STATE_STUNNED = 1 << 3,
     PLAYER_STATE_SPIRIT_FORM = 1 << 4,
+    PLAYER_STATE_FLAG_CARRIER = 1 << 5,
 };
+constexpr uint32 SPELL_WARSONG_FLAG = 23333;
+constexpr uint32 SPELL_SILVERWING_FLAG = 23335;
+constexpr uint32 SPELL_NETHERSTORM_FLAG = 34976;
 uint64 nextDeathEventId = 1;
 uint64 nextSessionEventId = 1;
 
@@ -380,6 +384,9 @@ public:
                     stateFlags |= PLAYER_STATE_STUNNED;
                 if (player->HasSpiritOfRedemptionAura())
                     stateFlags |= PLAYER_STATE_SPIRIT_FORM;
+                if (player->HasAura(SPELL_WARSONG_FLAG) || player->HasAura(SPELL_SILVERWING_FLAG) ||
+                    player->HasAura(SPELL_NETHERSTORM_FLAG))
+                    stateFlags |= PLAYER_STATE_FLAG_CARRIER;
                 players.push_back({player->GetName(),
                                    player->GetMapId(),
                                    player->GetInstanceId(),
@@ -440,7 +447,7 @@ public:
             }
         }
 
-        handler->SendSysMessage("WMAP_VERSION|6");
+        handler->SendSysMessage("WMAP_VERSION|7");
         for (TelemetryPlayer const& player : players)
         {
             handler->PSendSysMessage(
