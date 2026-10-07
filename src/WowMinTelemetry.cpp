@@ -72,6 +72,14 @@ std::unordered_map<uint64, std::unordered_map<uint64, uint32>> battlegroundRoles
 #endif
 constexpr std::size_t MAX_DEATH_HISTORY = 50;
 constexpr std::size_t MAX_EVENT_HISTORY = 1000;
+enum PlayerStateFlags : uint32
+{
+    PLAYER_STATE_TAXI = 1 << 0,
+    PLAYER_STATE_MOUNTED = 1 << 1,
+    PLAYER_STATE_SAPPED = 1 << 2,
+    PLAYER_STATE_STUNNED = 1 << 3,
+    PLAYER_STATE_SPIRIT_FORM = 1 << 4,
+};
 uint64 nextDeathEventId = 1;
 uint64 nextSessionEventId = 1;
 
@@ -278,6 +286,8 @@ struct TelemetryPlayer
     bool waitingForResurrect;
     int32 battlegroundRole;
     int32 wmoGroupId;
+    uint32 gender;
+    uint32 stateFlags;
 };
 
 class wowmin_telemetry_commandscript : public CommandScript
@@ -359,6 +369,17 @@ public:
 #endif
                 if (player->GetInstanceId())
                     activeSessionKeys.insert(GetSessionKey(player->GetMapId(), player->GetInstanceId()));
+                uint32 stateFlags = 0;
+                if (player->IsInFlight())
+                    stateFlags |= PLAYER_STATE_TAXI;
+                if (player->IsMounted())
+                    stateFlags |= PLAYER_STATE_MOUNTED;
+                if (player->HasAuraWithMechanic(1ULL << MECHANIC_SAPPED))
+                    stateFlags |= PLAYER_STATE_SAPPED;
+                if (player->HasUnitState(UNIT_STATE_STUNNED))
+                    stateFlags |= PLAYER_STATE_STUNNED;
+                if (player->HasSpiritOfRedemptionAura())
+                    stateFlags |= PLAYER_STATE_SPIRIT_FORM;
                 players.push_back({player->GetName(),
                                    player->GetMapId(),
                                    player->GetInstanceId(),
@@ -389,7 +410,9 @@ public:
                                    GetGroupRole(group, player->GetGUID()),
                                    player->HasAura(SPELL_WAITING_FOR_RESURRECT),
                                    battlegroundRole,
-                                   wmoGroupId});
+                                   wmoGroupId,
+                                   player->getGender(),
+                                   stateFlags});
             }
         }
 
@@ -417,19 +440,19 @@ public:
             }
         }
 
-        handler->SendSysMessage("WMAP_VERSION|5");
+        handler->SendSysMessage("WMAP_VERSION|6");
         for (TelemetryPlayer const& player : players)
         {
             handler->PSendSysMessage(
                 "WMAP|{}|{}|{}|{:.3f}|{:.3f}|{:.3f}|{:.3f}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:.1f}|{}|"
-                "{:.1f}|{}|{}|{}|{}|{}|{}|{}",
+                "{:.1f}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                 EscapeTelemetryField(player.name), player.mapId, player.instanceId, player.positionX, player.positionY,
                 player.positionZ, player.orientation, player.level, player.race, player.playerClass, player.accountId,
                 player.isBot ? 1 : 0, player.alive ? 1 : 0, player.inCombat ? 1 : 0, player.mapType, player.difficulty,
                 player.sessionStartedAt, player.groupId, player.isRaidGroup ? 1 : 0, player.subgroup, player.teamId,
                 player.healthPct, player.powerType, player.powerPct, player.targetGuid, player.targetType,
                 EscapeTelemetryField(player.targetName), player.roleMask, player.waitingForResurrect ? 1 : 0,
-                player.battlegroundRole, player.wmoGroupId);
+                player.battlegroundRole, player.wmoGroupId, player.gender, player.stateFlags);
         }
 
         std::size_t worldStateCount = 0;
