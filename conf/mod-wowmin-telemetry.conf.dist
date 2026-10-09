@@ -17,3 +17,39 @@
 #
 
 WowMinTelemetry.Enable = 0
+
+#
+#    WowMinTelemetry.Stream.Enable
+#        Description: Enables the "wowmin stream" command and the UDP position
+#                     stream. A session streams only while a client keeps
+#                     renewing its subscription (every few seconds), and only to
+#                     the destination below; commands cannot redirect it.
+#                     Requires WowMinTelemetry.Enable.
+#        Default:     0 - Disabled
+#                     1 - Enabled
+#
+
+WowMinTelemetry.Stream.Enable = 0
+
+#
+#    WowMinTelemetry.Stream.Host
+#    WowMinTelemetry.Stream.Port
+#        Description: Destination for stream datagrams: the machine and UDP port
+#                     wowmin listens on (WOWMIN_STREAM_PORT). Use an IP address,
+#                     not a host name. Keep this on localhost or a trusted
+#                     network; datagrams are not encrypted.
+#        Default:     "127.0.0.1", 7979
+#
+
+WowMinTelemetry.Stream.Host = "127.0.0.1"
+WowMinTelemetry.Stream.Port = 7979
+
+#
+#    WowMinTelemetry.Stream.IntervalMs
+#        Description: Milliseconds between position snapshots for each subscribed
+#                     session. The effective rate is also limited by the map
+#                     update rate. Minimum 20.
+#        Default:     100 (10 updates per second)
+#
+
+WowMinTelemetry.Stream.IntervalMs = 100

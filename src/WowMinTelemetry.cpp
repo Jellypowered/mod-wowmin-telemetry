@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -16,6 +17,9 @@
 #include <utility>
 #include <vector>
 
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/udp.hpp>
+
 #include "Battleground.h"
 #include "Chat.h"
 #include "ConfigValueCache.h"
@@ -24,6 +28,7 @@
 #include "Group.h"
 #include "InstanceScript.h"
 #include "Item.h"
+#include "Log.h"
 #include "Map.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
@@ -48,6 +53,10 @@ namespace
 enum class WowMinTelemetryConfig
 {
     Enabled,
+    StreamEnabled,
+    StreamHost,
+    StreamPort,
+    StreamIntervalMs,
 
     NumConfigs,
 };
@@ -60,6 +69,10 @@ public:
     void BuildConfigCache() override
     {
         SetConfigValue<bool>(WowMinTelemetryConfig::Enabled, "WowMinTelemetry.Enable", false);
+        SetConfigValue<bool>(WowMinTelemetryConfig::StreamEnabled, "WowMinTelemetry.Stream.Enable", false);
+        SetConfigValue<std::string>(WowMinTelemetryConfig::StreamHost, "WowMinTelemetry.Stream.Host", "127.0.0.1");
+        SetConfigValue<uint32>(WowMinTelemetryConfig::StreamPort, "WowMinTelemetry.Stream.Port", 7979);
+        SetConfigValue<uint32>(WowMinTelemetryConfig::StreamIntervalMs, "WowMinTelemetry.Stream.IntervalMs", 100);
     }
 };
 
@@ -151,6 +164,227 @@ std::string EscapeTelemetryField(std::string_view value)
     }
     return escaped;
 }
+
+uint32 GetPlayerStateFlags(Player* player)
+{
+    uint32 stateFlags = 0;
+    if (player->IsInFlight())
+        stateFlags |= PLAYER_STATE_TAXI;
+    if (player->IsMounted())
+        stateFlags |= PLAYER_STATE_MOUNTED;
+    if (player->HasAuraWithMechanic(1ULL << MECHANIC_SAPPED))
+        stateFlags |= PLAYER_STATE_SAPPED;
+    if (player->HasUnitState(UNIT_STATE_STUNNED))
+        stateFlags |= PLAYER_STATE_STUNNED;
+    if (player->HasSpiritOfRedemptionAura())
+        stateFlags |= PLAYER_STATE_SPIRIT_FORM;
+    if (player->HasAura(SPELL_WARSONG_FLAG) || player->HasAura(SPELL_SILVERWING_FLAG) ||
+        player->HasAura(SPELL_NETHERSTORM_FLAG))
+        stateFlags |= PLAYER_STATE_FLAG_CARRIER;
+    return stateFlags;
+}
+
+int32 GetPlayerWmoGroupId(Map* map, Player* player)
+{
+    uint32 mogpFlags = 0;
+    int32 adtId = 0;
+    int32 rootId = 0;
+    int32 wmoGroupId = -1;
+    if (!map->GetAreaInfo(player->GetPhaseMask(), player->GetPositionX(), player->GetPositionY(),
+                          player->GetPositionZ(), mogpFlags, adtId, rootId, wmoGroupId))
+        return -1;
+    return wmoGroupId;
+}
+
+// ── Position stream ──────────────────────────────────────────
+//
+// wowmin subscribes to a session with "wowmin stream <mapId> <instanceId>" and
+// renews it every few seconds. While subscribed, the session's map update
+// sends a UDP snapshot of its players to the configured destination (never one
+// chosen by the command) every WowMinTelemetry.Stream.IntervalMs.
+//
+// Datagram, little-endian:
+//   header (28 bytes): "WMS1", u8 version, u8 part, u8 partCount, u8 reserved,
+//     u32 mapId, u32 instanceId, u32 sequence, u32 serverTimeMs,
+//     u16 playerCount, u16 reserved
+//   player (30 bytes + name): u32 guid, f32 x, f32 y, f32 z, f32 orientation,
+//     u8 healthPct, u8 powerPct, i8 powerType, u8 flags (1 alive, 2 in combat,
+//     4 waiting to resurrect), u8 stateFlags, u8 nameLength, i32 wmoGroupId,
+//     name bytes
+// A snapshot larger than one datagram is split into parts sharing a sequence.
+
+constexpr uint8 STREAM_VERSION = 1;
+constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
+constexpr std::size_t STREAM_MAX_SUBSCRIPTIONS = 64;
+constexpr std::size_t STREAM_MAX_DATAGRAM = 1200;
+constexpr std::size_t STREAM_MAX_NAME = 48;
+constexpr uint32 STREAM_MIN_INTERVAL_MS = 20;
+
+struct StreamSubscription
+{
+    uint64 expiresAtMs;
+    uint32 elapsedMs;
+    uint32 sequence;
+};
+
+std::mutex streamStateMutex;
+std::unordered_map<uint64, StreamSubscription> streamSubscriptions;
+
+struct StreamPlayer
+{
+    uint32 guid;
+    float x;
+    float y;
+    float z;
+    float orientation;
+    uint8 healthPct;
+    uint8 powerPct;
+    int8 powerType;
+    uint8 flags;
+    uint8 stateFlags;
+    int32 wmoGroupId;
+    std::string name;
+};
+
+void AppendU8(std::vector<uint8>& out, uint8 value) { out.push_back(value); }
+
+void AppendU16(std::vector<uint8>& out, uint16 value)
+{
+    out.push_back(uint8(value));
+    out.push_back(uint8(value >> 8));
+}
+
+void AppendU32(std::vector<uint8>& out, uint32 value)
+{
+    for (int shift = 0; shift < 32; shift += 8)
+        out.push_back(uint8(value >> shift));
+}
+
+void AppendF32(std::vector<uint8>& out, float value)
+{
+    uint32 bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    AppendU32(out, bits);
+}
+
+std::vector<std::vector<uint8>> BuildStreamDatagrams(uint32 mapId, uint32 instanceId, uint32 sequence,
+                                                     uint32 serverTimeMs, std::vector<StreamPlayer> const& players)
+{
+    std::vector<std::vector<uint8>> datagrams;
+    auto startDatagram = [&]()
+    {
+        std::vector<uint8>& datagram = datagrams.emplace_back();
+        datagram.reserve(STREAM_MAX_DATAGRAM);
+        datagram.insert(datagram.end(), {'W', 'M', 'S', '1'});
+        AppendU8(datagram, STREAM_VERSION);
+        AppendU8(datagram, 0); // part, patched below
+        AppendU8(datagram, 0); // partCount, patched below
+        AppendU8(datagram, 0);
+        AppendU32(datagram, mapId);
+        AppendU32(datagram, instanceId);
+        AppendU32(datagram, sequence);
+        AppendU32(datagram, serverTimeMs);
+        AppendU16(datagram, 0); // playerCount, patched below
+        AppendU16(datagram, 0);
+    };
+    startDatagram();
+    uint16 count = 0;
+    auto finishDatagram = [&]()
+    {
+        datagrams.back()[24] = uint8(count);
+        datagrams.back()[25] = uint8(count >> 8);
+        count = 0;
+    };
+
+    for (StreamPlayer const& player : players)
+    {
+        std::size_t const nameLength = std::min(player.name.size(), STREAM_MAX_NAME);
+        if (count && datagrams.back().size() + 30 + nameLength > STREAM_MAX_DATAGRAM)
+        {
+            finishDatagram();
+            startDatagram();
+        }
+        std::vector<uint8>& datagram = datagrams.back();
+        AppendU32(datagram, player.guid);
+        AppendF32(datagram, player.x);
+        AppendF32(datagram, player.y);
+        AppendF32(datagram, player.z);
+        AppendF32(datagram, player.orientation);
+        AppendU8(datagram, player.healthPct);
+        AppendU8(datagram, player.powerPct);
+        AppendU8(datagram, uint8(player.powerType));
+        AppendU8(datagram, player.flags);
+        AppendU8(datagram, player.stateFlags);
+        AppendU8(datagram, uint8(nameLength));
+        AppendU32(datagram, uint32(player.wmoGroupId));
+        datagram.insert(datagram.end(), player.name.begin(), player.name.begin() + nameLength);
+        ++count;
+    }
+    finishDatagram();
+
+    std::size_t const partCount = std::min<std::size_t>(datagrams.size(), 255);
+    datagrams.resize(partCount);
+    for (std::size_t part = 0; part < partCount; ++part)
+    {
+        datagrams[part][5] = uint8(part);
+        datagrams[part][6] = uint8(partCount);
+    }
+    return datagrams;
+}
+
+// One non-blocking UDP socket shared by every map thread. Sends are a single
+// kernel copy each, so a mutex is cheaper than handing off to another thread.
+class StreamSender
+{
+public:
+    void Send(std::vector<std::vector<uint8>> const& datagrams, std::string_view host, uint32 port)
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_socket || host != _host || port != _port)
+            Open(host, port);
+        if (!_socket)
+            return;
+        for (std::vector<uint8> const& datagram : datagrams)
+        {
+            boost::system::error_code error;
+            _socket->send_to(boost::asio::buffer(datagram), _endpoint, 0, error);
+        }
+    }
+
+private:
+    void Open(std::string_view host, uint32 port)
+    {
+        _host = host;
+        _port = port;
+        _socket.reset();
+        boost::system::error_code error;
+        boost::asio::ip::address const address = boost::asio::ip::make_address(std::string(host), error);
+        if (error || !port || port > 65535)
+        {
+            LOG_ERROR("module", "WoWMin telemetry stream: invalid destination {}:{}", host, port);
+            return;
+        }
+        _endpoint = boost::asio::ip::udp::endpoint(address, uint16(port));
+        _socket.emplace(_context);
+        _socket->open(_endpoint.protocol(), error);
+        if (!error)
+            _socket->non_blocking(true, error);
+        if (error)
+        {
+            LOG_ERROR("module", "WoWMin telemetry stream: could not open UDP socket: {}", error.message());
+            _socket.reset();
+        }
+    }
+
+    std::mutex _mutex;
+    boost::asio::io_context _context;
+    std::optional<boost::asio::ip::udp::socket> _socket;
+    boost::asio::ip::udp::endpoint _endpoint;
+    std::string _host;
+    uint32 _port = 0;
+};
+
+StreamSender streamSender;
 
 struct TelemetryWorldState
 {
@@ -303,6 +537,7 @@ public:
     {
         static ChatCommandTable wowminCommandTable = {
             {"telemetry", HandleTelemetryCommand, SEC_ADMINISTRATOR, Console::Yes},
+            {"stream", HandleStreamCommand, SEC_ADMINISTRATOR, Console::Yes},
         };
 
         static ChatCommandTable commandTable = {
@@ -310,6 +545,54 @@ public:
         };
 
         return commandTable;
+    }
+
+    // Subscribes (or renews) a session's position stream for the next
+    // STREAM_SUBSCRIPTION_TTL_MS. Replies "WSTREAM|<version>|<port>|<intervalMs>|<ttlMs>"
+    // or "WSTREAM|disabled".
+    static bool HandleStreamCommand(ChatHandler* handler, char const* args)
+    {
+        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) ||
+            !telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::StreamEnabled))
+        {
+            handler->SendSysMessage("WSTREAM|disabled");
+            return true;
+        }
+
+        std::istringstream arguments(args ? args : "");
+        std::string mapArgument;
+        std::string instanceArgument;
+        std::string unexpectedArgument;
+        arguments >> mapArgument >> instanceArgument;
+        auto const mapId = Acore::StringTo<uint32>(mapArgument);
+        auto const instanceId = Acore::StringTo<uint32>(instanceArgument);
+        if (!mapId || !instanceId || !*instanceId || arguments >> unexpectedArgument)
+        {
+            handler->SendSysMessage("Usage: wowmin stream <mapId> <instanceId>");
+            return false;
+        }
+
+        uint64 const expiresAtMs = GameTime::GetGameTimeMS().count() + STREAM_SUBSCRIPTION_TTL_MS;
+        {
+            std::lock_guard<std::mutex> lock(streamStateMutex);
+            uint64 const sessionKey = GetSessionKey(*mapId, *instanceId);
+            auto const iterator = streamSubscriptions.find(sessionKey);
+            if (iterator != streamSubscriptions.end())
+                iterator->second.expiresAtMs = expiresAtMs;
+            else if (streamSubscriptions.size() < STREAM_MAX_SUBSCRIPTIONS)
+                streamSubscriptions.emplace(sessionKey, StreamSubscription{expiresAtMs, 0, 0});
+            else
+            {
+                handler->SendSysMessage("WSTREAM|full");
+                return true;
+            }
+        }
+        handler->PSendSysMessage("WSTREAM|{}|{}|{}|{}", STREAM_VERSION,
+                                 telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::StreamPort),
+                                 std::max(STREAM_MIN_INTERVAL_MS,
+                                          telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::StreamIntervalMs)),
+                                 STREAM_SUBSCRIPTION_TTL_MS);
+        return true;
     }
 
     static bool HandleTelemetryCommand(ChatHandler* handler, char const* args)
@@ -359,13 +642,7 @@ public:
                 Unit* target = player->GetSelectedUnit();
                 Powers const powerType = player->getPowerType();
                 int32 battlegroundRole = -1;
-                uint32 mogpFlags = 0;
-                int32 adtId = 0;
-                int32 rootId = 0;
-                int32 wmoGroupId = -1;
-                if (!map->GetAreaInfo(player->GetPhaseMask(), player->GetPositionX(), player->GetPositionY(),
-                                      player->GetPositionZ(), mogpFlags, adtId, rootId, wmoGroupId))
-                    wmoGroupId = -1;
+                int32 const wmoGroupId = GetPlayerWmoGroupId(map, player);
 #ifdef MOD_PLAYERBOTS
                 if (session->IsHeadless() && map->IsBattlegroundOrArena())
                     battlegroundRole =
@@ -373,20 +650,7 @@ public:
 #endif
                 if (player->GetInstanceId())
                     activeSessionKeys.insert(GetSessionKey(player->GetMapId(), player->GetInstanceId()));
-                uint32 stateFlags = 0;
-                if (player->IsInFlight())
-                    stateFlags |= PLAYER_STATE_TAXI;
-                if (player->IsMounted())
-                    stateFlags |= PLAYER_STATE_MOUNTED;
-                if (player->HasAuraWithMechanic(1ULL << MECHANIC_SAPPED))
-                    stateFlags |= PLAYER_STATE_SAPPED;
-                if (player->HasUnitState(UNIT_STATE_STUNNED))
-                    stateFlags |= PLAYER_STATE_STUNNED;
-                if (player->HasSpiritOfRedemptionAura())
-                    stateFlags |= PLAYER_STATE_SPIRIT_FORM;
-                if (player->HasAura(SPELL_WARSONG_FLAG) || player->HasAura(SPELL_SILVERWING_FLAG) ||
-                    player->HasAura(SPELL_NETHERSTORM_FLAG))
-                    stateFlags |= PLAYER_STATE_FLAG_CARRIER;
+                uint32 const stateFlags = GetPlayerStateFlags(player);
                 players.push_back({player->GetName(),
                                    player->GetMapId(),
                                    player->GetInstanceId(),
@@ -542,6 +806,9 @@ public:
         instanceStates.erase(sessionKey);
         deathHistory.erase(sessionKey);
         eventHistory.erase(sessionKey);
+
+        std::lock_guard<std::mutex> streamLock(streamStateMutex);
+        streamSubscriptions.erase(sessionKey);
     }
 
     void OnMapUpdate(Map* map, uint32 diff) override
@@ -550,6 +817,9 @@ public:
             return;
 
         uint64 const sessionKey = GetSessionKey(map->GetId(), map->GetInstanceId());
+        if (telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) &&
+            telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::StreamEnabled))
+            StreamPositions(map, sessionKey, diff);
         {
             std::lock_guard<std::mutex> lock(telemetryStateMutex);
             uint32& updateTimer = mapUpdateTimers[sessionKey];
@@ -566,6 +836,65 @@ public:
     }
 
 private:
+    // Runs on the map's own update thread, so its players can be read directly.
+    static void StreamPositions(Map* map, uint64 sessionKey, uint32 diff)
+    {
+        uint32 const intervalMs = std::max(
+            STREAM_MIN_INTERVAL_MS, telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::StreamIntervalMs));
+        uint64 const nowMs = GameTime::GetGameTimeMS().count();
+        uint32 sequence = 0;
+        {
+            std::lock_guard<std::mutex> lock(streamStateMutex);
+            auto const iterator = streamSubscriptions.find(sessionKey);
+            if (iterator == streamSubscriptions.end())
+                return;
+            if (iterator->second.expiresAtMs < nowMs)
+            {
+                streamSubscriptions.erase(iterator);
+                return;
+            }
+            iterator->second.elapsedMs += diff;
+            if (iterator->second.elapsedMs < intervalMs)
+                return;
+            // Drop missed intervals rather than sending a burst after a slow tick.
+            iterator->second.elapsedMs = 0;
+            sequence = ++iterator->second.sequence;
+        }
+
+        std::vector<StreamPlayer> players;
+        for (auto const& playerReference : map->GetPlayers())
+        {
+            Player* player = playerReference.GetSource();
+            if (!player || !player->IsInWorld())
+                continue;
+            Powers const powerType = player->getPowerType();
+            uint8 flags = 0;
+            if (player->IsAlive())
+                flags |= 1;
+            if (player->IsInCombat())
+                flags |= 2;
+            if (player->HasAura(SPELL_WAITING_FOR_RESURRECT))
+                flags |= 4;
+            players.push_back({player->GetGUID().GetCounter(),
+                               player->GetPositionX(),
+                               player->GetPositionY(),
+                               player->GetPositionZ(),
+                               player->GetOrientation(),
+                               uint8(std::clamp(player->GetHealthPct(), 0.0f, 100.0f)),
+                               uint8(std::clamp(player->GetPowerPct(powerType), 0.0f, 100.0f)),
+                               int8(powerType),
+                               flags,
+                               uint8(GetPlayerStateFlags(player)),
+                               GetPlayerWmoGroupId(map, player),
+                               player->GetName()});
+        }
+
+        std::string_view const host = telemetryConfig.GetConfigValue(WowMinTelemetryConfig::StreamHost);
+        uint32 const port = telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::StreamPort);
+        streamSender.Send(BuildStreamDatagrams(map->GetId(), map->GetInstanceId(), sequence, uint32(nowMs), players),
+                          host, port);
+    }
+
     static void CaptureBattleground(BattlegroundMap* map, uint64 sessionKey)
     {
         Battleground* battleground = map->GetBG();
