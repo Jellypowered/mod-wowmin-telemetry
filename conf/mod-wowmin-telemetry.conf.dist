@@ -24,6 +24,8 @@ WowMinTelemetry.Enable = 0
 #                     stream. A session streams only while a client keeps
 #                     renewing its subscription (every few seconds), and only to
 #                     the destination below; commands cannot redirect it.
+#                     Besides positions it carries movement paths, creatures,
+#                     and, with mod-playerbots, what each bot is deciding.
 #                     Requires WowMinTelemetry.Enable.
 #        Default:     0 - Disabled
 #                     1 - Enabled

@@ -3,9 +3,11 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -20,8 +22,10 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/udp.hpp>
 
+#include "AbstractFollower.h"
 #include "Battleground.h"
 #include "Chat.h"
+#include "Creature.h"
 #include "ConfigValueCache.h"
 #include "DBCStores.h"
 #include "GameTime.h"
@@ -30,18 +34,25 @@
 #include "Item.h"
 #include "Log.h"
 #include "Map.h"
+#include "MotionMaster.h"
+#include "MovementGenerator.h"
+#include "MoveSpline.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "StringConvert.h"
+#include "TypeContainerVisitor.h"
 #include "Unit.h"
 #include "WorldSession.h"
 #include "WorldStatePackets.h"
 
 #ifdef MOD_PLAYERBOTS
+#include "Action.h"
 #include "AiObjectContext.h"
 #include "BattleGroundTactics.h"
+#include "Engine.h"
+#include "LastMovementValue.h"
 #include "PlayerbotAI.h"
 #include "PlayerbotMgr.h"
 #endif
@@ -184,14 +195,14 @@ uint32 GetPlayerStateFlags(Player* player)
     return stateFlags;
 }
 
-int32 GetPlayerWmoGroupId(Map* map, Player* player)
+int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 {
     uint32 mogpFlags = 0;
     int32 adtId = 0;
     int32 rootId = 0;
     int32 wmoGroupId = -1;
-    if (!map->GetAreaInfo(player->GetPhaseMask(), player->GetPositionX(), player->GetPositionY(),
-                          player->GetPositionZ(), mogpFlags, adtId, rootId, wmoGroupId))
+    if (!map->GetAreaInfo(unit->GetPhaseMask(), unit->GetPositionX(), unit->GetPositionY(), unit->GetPositionZ(),
+                          mogpFlags, adtId, rootId, wmoGroupId))
         return -1;
     return wmoGroupId;
 }
@@ -212,6 +223,44 @@ int32 GetPlayerWmoGroupId(Map* map, Player* player)
 //     4 waiting to resurrect), u8 stateFlags, u8 nameLength, i32 wmoGroupId,
 //     name bytes
 // A snapshot larger than one datagram is split into parts sharing a sequence.
+//
+// Movement paths go in separate datagrams, sent alongside a snapshot when a
+// player's server-driven path changes and re-sent every
+// STREAM_PATH_REFRESH_MS while it lasts. Each path entry stands alone.
+//   header (24 bytes): "WMP1", u8 version, u8 reserved x3, u32 mapId,
+//     u32 instanceId, u32 serverTimeMs, u16 pathCount, u16 reserved
+//   path (12 bytes + points): u32 guid, u32 splineId (0: no longer moving on
+//     a path), u8 pointCount, u8 flags (1 truncated: the middle of the path
+//     was dropped; 2 the guid is a creature's, not a player's), u16 reserved,
+//     then pointCount x (f32 x, f32 y, f32 z): the waypoints still ahead,
+//     ending at the destination
+//
+// Creatures go in their own datagrams too: each one whenever it moves, fights,
+// or changes, and every STREAM_CREATURE_REFRESH_MS otherwise. A creature not
+// re-sent for a few seconds has despawned. Triggers, totems, and critters are
+// left out. Names, levels, and ranks come from the world database by entry.
+//   header (24 bytes): "WMC1", then as for paths, with u16 creatureCount
+//   creature (36 bytes): u32 guid, u32 entry, f32 x, f32 y, f32 z,
+//     f32 orientation, u8 healthPct, u8 flags (1 alive, 2 in combat, 4 hostile
+//     to players, 8 boss, 16 controlled by a player, e.g. a pet, 32 its target
+//     is a player), u16 reserved, u32 targetGuid (0: none), i32 wmoGroupId
+//
+// With mod-playerbots, what each bot is deciding goes in its own datagrams
+// too: whenever it changes (at most every STREAM_BOT_MIN_INTERVAL_MS) and
+// every STREAM_BOT_REFRESH_MS otherwise. The module only listens to the bot's
+// engines and never changes what they do.
+//   header (24 bytes): "WMB1", then as for paths, with u16 botCount
+//   bot (36 bytes + strategies + actions): u32 guid, u8 state (0 combat,
+//     1 out of combat, 2 dead), u8 motionType (the core's
+//     MovementGeneratorType; 255: none), u8 movePriority (0 idle, 1 wander,
+//     2 normal, 3 combat, 4 forced), u8 flags (1 it has a move target, 2 its
+//     motion target is a player, 4 its selected target is a player),
+//     f32 moveX, f32 moveY, f32 moveZ (where it last chose to move),
+//     u32 moveAgeMs, u32 motionTargetGuid (whom it follows or chases; 0: none),
+//     u32 targetGuid (its selection; 0: none), u16 strategiesLength,
+//     u8 actionCount, u8 reserved, the strategies of its current state
+//     (comma-separated), then actionCount x (u8 nameLength, u8 reserved,
+//     u16 repeats, f32 relevance, u32 ageMs, name bytes), newest first
 
 constexpr uint8 STREAM_VERSION = 1;
 constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
@@ -219,12 +268,56 @@ constexpr std::size_t STREAM_MAX_SUBSCRIPTIONS = 64;
 constexpr std::size_t STREAM_MAX_DATAGRAM = 1200;
 constexpr std::size_t STREAM_MAX_NAME = 48;
 constexpr uint32 STREAM_MIN_INTERVAL_MS = 20;
+constexpr std::size_t STREAM_MAX_PATH_POINTS = 32;
+constexpr uint64 STREAM_PATH_REFRESH_MS = 1000;
+constexpr uint64 STREAM_CREATURE_REFRESH_MS = 1000;
+// A creature that has moved this far since its last update is re-sent, and
+// its WMO group looked up again.
+constexpr float STREAM_CREATURE_MOVE_YARDS = 0.5f;
+constexpr uint64 STREAM_BOT_REFRESH_MS = 1000;
+constexpr uint64 STREAM_BOT_MIN_INTERVAL_MS = 250;
+constexpr std::size_t STREAM_MAX_STRATEGIES = 400;
+constexpr std::size_t STREAM_MAX_ACTION_NAME = 48;
+// Actions kept per bot; a run of the same action counts as one.
+constexpr std::size_t BOT_ACTION_HISTORY = 6;
+
+// What was last sent for each path and creature, keyed by guid. Only the
+// session's map thread uses it.
+struct StreamSessionState
+{
+    struct SentPath
+    {
+        uint32 splineId = 0;
+        uint64 sentAtMs = 0;
+    };
+    struct SentCreature
+    {
+        uint64 sentAtMs = 0;
+        uint8 healthPct = 0;
+        uint8 flags = 0;
+        uint32 targetGuid = 0;
+        float x = 0.0f;
+        float y = 0.0f;
+        float z = 0.0f;
+        int32 wmoGroupId = -1;
+    };
+    std::unordered_map<uint32, SentPath> playerPaths;
+    std::unordered_map<uint32, SentPath> creaturePaths;
+    struct SentBot
+    {
+        uint64 sentAtMs = 0;
+        std::size_t signature = 0;
+    };
+    std::unordered_map<uint32, SentCreature> creatures;
+    std::unordered_map<uint32, SentBot> bots;
+};
 
 struct StreamSubscription
 {
     uint64 expiresAtMs;
     uint32 elapsedMs;
     uint32 sequence;
+    std::shared_ptr<StreamSessionState> state;
 };
 
 std::mutex streamStateMutex;
@@ -244,6 +337,53 @@ struct StreamPlayer
     uint8 stateFlags;
     int32 wmoGroupId;
     std::string name;
+};
+
+struct StreamPath
+{
+    uint32 guid;
+    uint32 splineId;
+    uint8 flags;
+    std::vector<G3D::Vector3> points;
+};
+
+struct StreamCreature
+{
+    uint32 guid;
+    uint32 entry;
+    float x;
+    float y;
+    float z;
+    float orientation;
+    uint8 healthPct;
+    uint8 flags;
+    uint32 targetGuid;
+    int32 wmoGroupId;
+};
+
+struct StreamBotAction
+{
+    std::string name;
+    float relevance;
+    uint32 ageMs;
+    uint16 repeats;
+};
+
+struct StreamBot
+{
+    uint32 guid = 0;
+    uint8 state = 0;
+    uint8 motionType = 255;
+    uint8 movePriority = 0;
+    uint8 flags = 0;
+    float moveX = 0.0f;
+    float moveY = 0.0f;
+    float moveZ = 0.0f;
+    uint32 moveAgeMs = 0;
+    uint32 motionTargetGuid = 0;
+    uint32 targetGuid = 0;
+    std::string strategies;
+    std::vector<StreamBotAction> actions;
 };
 
 void AppendU8(std::vector<uint8>& out, uint8 value) { out.push_back(value); }
@@ -330,6 +470,279 @@ std::vector<std::vector<uint8>> BuildStreamDatagrams(uint32 mapId, uint32 instan
         datagrams[part][6] = uint8(partCount);
     }
     return datagrams;
+}
+
+// Packs self-contained entries into as few datagrams as fit, each with the
+// 24-byte header that path and creature datagrams share.
+std::vector<std::vector<uint8>> PackEntries(std::string_view magic, uint32 mapId, uint32 instanceId,
+                                            uint32 serverTimeMs, std::vector<std::vector<uint8>> const& entries)
+{
+    std::vector<std::vector<uint8>> datagrams;
+    uint16 count = 0;
+    auto finishDatagram = [&]()
+    {
+        datagrams.back()[20] = uint8(count);
+        datagrams.back()[21] = uint8(count >> 8);
+        count = 0;
+    };
+    for (std::vector<uint8> const& entry : entries)
+    {
+        if (datagrams.empty() || datagrams.back().size() + entry.size() > STREAM_MAX_DATAGRAM)
+        {
+            if (!datagrams.empty())
+                finishDatagram();
+            std::vector<uint8>& datagram = datagrams.emplace_back();
+            datagram.reserve(STREAM_MAX_DATAGRAM);
+            datagram.insert(datagram.end(), magic.begin(), magic.end());
+            AppendU8(datagram, STREAM_VERSION);
+            AppendU8(datagram, 0);
+            AppendU16(datagram, 0);
+            AppendU32(datagram, mapId);
+            AppendU32(datagram, instanceId);
+            AppendU32(datagram, serverTimeMs);
+            AppendU16(datagram, 0); // entry count, patched by finishDatagram
+            AppendU16(datagram, 0);
+        }
+        datagrams.back().insert(datagrams.back().end(), entry.begin(), entry.end());
+        ++count;
+    }
+    if (!datagrams.empty())
+        finishDatagram();
+    return datagrams;
+}
+
+std::vector<std::vector<uint8>> BuildPathDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
+                                                   std::vector<StreamPath> const& paths)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(paths.size());
+    for (StreamPath const& path : paths)
+    {
+        std::size_t const pointCount = std::min(path.points.size(), STREAM_MAX_PATH_POINTS);
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(12 + pointCount * 12);
+        AppendU32(entry, path.guid);
+        AppendU32(entry, path.splineId);
+        AppendU8(entry, uint8(pointCount));
+        AppendU8(entry, path.flags);
+        AppendU16(entry, 0);
+        for (std::size_t index = 0; index < pointCount; ++index)
+        {
+            AppendF32(entry, path.points[index].x);
+            AppendF32(entry, path.points[index].y);
+            AppendF32(entry, path.points[index].z);
+        }
+    }
+    return PackEntries("WMP1", mapId, instanceId, serverTimeMs, entries);
+}
+
+std::vector<std::vector<uint8>> BuildCreatureDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
+                                                       std::vector<StreamCreature> const& creatures)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(creatures.size());
+    for (StreamCreature const& creature : creatures)
+    {
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(36);
+        AppendU32(entry, creature.guid);
+        AppendU32(entry, creature.entry);
+        AppendF32(entry, creature.x);
+        AppendF32(entry, creature.y);
+        AppendF32(entry, creature.z);
+        AppendF32(entry, creature.orientation);
+        AppendU8(entry, creature.healthPct);
+        AppendU8(entry, creature.flags);
+        AppendU16(entry, 0);
+        AppendU32(entry, creature.targetGuid);
+        AppendU32(entry, uint32(creature.wmoGroupId));
+    }
+    return PackEntries("WMC1", mapId, instanceId, serverTimeMs, entries);
+}
+
+std::vector<std::vector<uint8>> BuildBotDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
+                                                  std::vector<StreamBot> const& bots)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(bots.size());
+    for (StreamBot const& bot : bots)
+    {
+        std::size_t const strategiesLength = std::min(bot.strategies.size(), STREAM_MAX_STRATEGIES);
+        std::size_t const actionCount = std::min(bot.actions.size(), BOT_ACTION_HISTORY);
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(36 + strategiesLength + actionCount * (12 + STREAM_MAX_ACTION_NAME));
+        AppendU32(entry, bot.guid);
+        AppendU8(entry, bot.state);
+        AppendU8(entry, bot.motionType);
+        AppendU8(entry, bot.movePriority);
+        AppendU8(entry, bot.flags);
+        AppendF32(entry, bot.moveX);
+        AppendF32(entry, bot.moveY);
+        AppendF32(entry, bot.moveZ);
+        AppendU32(entry, bot.moveAgeMs);
+        AppendU32(entry, bot.motionTargetGuid);
+        AppendU32(entry, bot.targetGuid);
+        AppendU16(entry, uint16(strategiesLength));
+        AppendU8(entry, uint8(actionCount));
+        AppendU8(entry, 0);
+        entry.insert(entry.end(), bot.strategies.begin(), bot.strategies.begin() + strategiesLength);
+        for (std::size_t index = 0; index < actionCount; ++index)
+        {
+            StreamBotAction const& action = bot.actions[index];
+            std::size_t const nameLength = std::min(action.name.size(), STREAM_MAX_ACTION_NAME);
+            AppendU8(entry, uint8(nameLength));
+            AppendU8(entry, 0);
+            AppendU16(entry, action.repeats);
+            AppendF32(entry, action.relevance);
+            AppendU32(entry, action.ageMs);
+            entry.insert(entry.end(), action.name.begin(), action.name.begin() + nameLength);
+        }
+    }
+    return PackEntries("WMB1", mapId, instanceId, serverTimeMs, entries);
+}
+
+#ifdef MOD_PLAYERBOTS
+// The latest actions a bot has carried out, oldest first. Recorders on the
+// bot's engines append to it, normally from the bot's map thread (the one that
+// streams it), but playerbots can run actions from the world thread too.
+struct BotActionLog
+{
+    std::mutex mutex;
+    struct Entry
+    {
+        std::string name;
+        float relevance;
+        uint64 atMs;
+        uint16 repeats;
+    };
+    std::deque<Entry> entries;
+    uint32 revision = 0;
+};
+
+// Listens to one bot engine without changing what it does. The engine owns
+// and deletes it, which expires `alive`.
+class BotActionRecorder : public ActionExecutionListener
+{
+public:
+    BotActionRecorder(std::shared_ptr<BotActionLog> log, std::shared_ptr<bool> alive)
+        : _log(std::move(log)), _alive(std::move(alive))
+    {
+    }
+
+    bool Before(Action* /*action*/, Event /*event*/) override { return true; }
+    bool AllowExecution(Action* /*action*/, Event /*event*/) override { return true; }
+    bool OverrideResult(Action* /*action*/, bool executed, Event /*event*/) override { return executed; }
+
+    void After(Action* action, bool executed, Event /*event*/) override
+    {
+        if (!executed || !action)
+            return;
+        std::string const name = action->getName();
+        uint64 const nowMs = GameTime::GetGameTimeMS().count();
+        std::lock_guard<std::mutex> lock(_log->mutex);
+        ++_log->revision;
+        if (!_log->entries.empty() && _log->entries.back().name == name)
+        {
+            BotActionLog::Entry& last = _log->entries.back();
+            last.relevance = action->getRelevance();
+            last.atMs = nowMs;
+            if (last.repeats < UINT16_MAX)
+                ++last.repeats;
+            return;
+        }
+        _log->entries.push_back({name, action->getRelevance(), nowMs, 1});
+        if (_log->entries.size() > BOT_ACTION_HISTORY)
+            _log->entries.pop_front();
+    }
+
+private:
+    std::shared_ptr<BotActionLog> _log;
+    std::shared_ptr<bool> _alive;
+};
+
+// Each streamed bot's action log, and the engines recording into it. Bots on
+// different maps update on different threads, hence the mutex.
+struct BotActionTracking
+{
+    std::shared_ptr<BotActionLog> log = std::make_shared<BotActionLog>();
+    std::vector<std::pair<Engine const*, std::weak_ptr<bool>>> engines;
+};
+std::mutex botActionTrackingMutex;
+std::unordered_map<uint32, BotActionTracking> botActionTracking;
+
+// Returns the bot's action log, first adding a recorder to `engine` (its
+// current one) if it has none. A bot's engines change with combat, so each
+// gets one as it comes into use.
+std::shared_ptr<BotActionLog> TrackBotActions(uint32 guid, Engine* engine)
+{
+    std::lock_guard<std::mutex> lock(botActionTrackingMutex);
+    BotActionTracking& tracking = botActionTracking[guid];
+    std::erase_if(tracking.engines, [](auto const& attached) { return attached.second.expired(); });
+    bool const recorded = std::any_of(tracking.engines.begin(), tracking.engines.end(),
+                                      [&](auto const& attached) { return attached.first == engine; });
+    if (engine && !recorded)
+    {
+        auto alive = std::make_shared<bool>(true);
+        engine->AddActionExecutionListener(new BotActionRecorder(tracking.log, alive));
+        tracking.engines.emplace_back(engine, alive);
+        // Forget bots whose engines have all gone, i.e. that logged out.
+        std::erase_if(botActionTracking,
+                      [&](auto const& entry)
+                      {
+                          return entry.first != guid &&
+                                 std::all_of(entry.second.engines.begin(), entry.second.engines.end(),
+                                             [](auto const& attached) { return attached.second.expired(); });
+                      });
+    }
+    return tracking.log;
+}
+#endif
+
+// Collects the creatures in a map's object store (spawns, summons, and pets).
+class StreamCreatureCollector
+{
+public:
+    explicit StreamCreatureCollector(std::vector<Creature*>& creatures) : _creatures(creatures) {}
+
+    void Visit(std::unordered_map<ObjectGuid, Creature*>& creatureMap)
+    {
+        for (auto const& [guid, creature] : creatureMap)
+            _creatures.push_back(creature);
+    }
+
+    template<class T>
+    void Visit(std::unordered_map<ObjectGuid, T*>&) {}
+
+private:
+    std::vector<Creature*>& _creatures;
+};
+
+// The waypoints still ahead of a unit moving under server control (bots, and
+// players while feared, charmed, or scripted), ending at its destination; empty
+// when it is standing still, steering itself, or on a flight path. Long paths
+// keep their first points and the destination, and set `truncated`.
+std::vector<G3D::Vector3> GetRemainingPath(Unit* unit, bool& truncated)
+{
+    truncated = false;
+    Movement::MoveSpline const* moveSpline = unit->movespline;
+    if (!moveSpline || !moveSpline->Initialized() || moveSpline->Finalized() || unit->IsInFlight())
+        return {};
+    Movement::MoveSpline::MySpline const& spline = moveSpline->_Spline();
+    int32 const first = moveSpline->_currentSplineIdx() + 1;
+    int32 const last = spline.last();
+    if (first > last)
+        return {};
+
+    std::vector<G3D::Vector3> points;
+    int32 const count = last - first + 1;
+    int32 const kept = std::min<int32>(count, int32(STREAM_MAX_PATH_POINTS));
+    truncated = kept < count;
+    points.reserve(kept);
+    for (int32 index = first; index < first + kept - (truncated ? 1 : 0); ++index)
+        points.push_back(spline.getPoint(index));
+    if (truncated)
+        points.push_back(spline.getPoint(last));
+    return points;
 }
 
 // One non-blocking UDP socket shared by every map thread. Sends are a single
@@ -580,7 +993,8 @@ public:
             if (iterator != streamSubscriptions.end())
                 iterator->second.expiresAtMs = expiresAtMs;
             else if (streamSubscriptions.size() < STREAM_MAX_SUBSCRIPTIONS)
-                streamSubscriptions.emplace(sessionKey, StreamSubscription{expiresAtMs, 0, 0});
+                streamSubscriptions.emplace(
+                    sessionKey, StreamSubscription{expiresAtMs, 0, 0, std::make_shared<StreamSessionState>()});
             else
             {
                 handler->SendSysMessage("WSTREAM|full");
@@ -642,7 +1056,7 @@ public:
                 Unit* target = player->GetSelectedUnit();
                 Powers const powerType = player->getPowerType();
                 int32 battlegroundRole = -1;
-                int32 const wmoGroupId = GetPlayerWmoGroupId(map, player);
+                int32 const wmoGroupId = GetUnitWmoGroupId(map, player);
 #ifdef MOD_PLAYERBOTS
                 if (session->IsHeadless() && map->IsBattlegroundOrArena())
                     battlegroundRole =
@@ -843,6 +1257,7 @@ private:
             STREAM_MIN_INTERVAL_MS, telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::StreamIntervalMs));
         uint64 const nowMs = GameTime::GetGameTimeMS().count();
         uint32 sequence = 0;
+        std::shared_ptr<StreamSessionState> state;
         {
             std::lock_guard<std::mutex> lock(streamStateMutex);
             auto const iterator = streamSubscriptions.find(sessionKey);
@@ -859,9 +1274,12 @@ private:
             // Drop missed intervals rather than sending a burst after a slow tick.
             iterator->second.elapsedMs = 0;
             sequence = ++iterator->second.sequence;
+            state = iterator->second.state;
         }
 
         std::vector<StreamPlayer> players;
+        std::vector<StreamPath> paths;
+        std::vector<StreamBot> bots;
         for (auto const& playerReference : map->GetPlayers())
         {
             Player* player = playerReference.GetSource();
@@ -885,14 +1303,216 @@ private:
                                int8(powerType),
                                flags,
                                uint8(GetPlayerStateFlags(player)),
-                               GetPlayerWmoGroupId(map, player),
+                               GetUnitWmoGroupId(map, player),
                                player->GetName()});
+            CollectPathChange(player, player->GetGUID().GetCounter(), false, state->playerPaths, nowMs, paths);
+#ifdef MOD_PLAYERBOTS
+            if (player->GetSession() && player->GetSession()->IsHeadless())
+                CollectBot(map, player, *state, nowMs, bots);
+#endif
         }
+        // Forget players who have left, so a return is sent as new.
+        for (auto iterator = state->playerPaths.begin(); iterator != state->playerPaths.end();)
+        {
+            bool const present = std::any_of(players.begin(), players.end(),
+                [&](StreamPlayer const& player) { return player.guid == iterator->first; });
+            iterator = present ? std::next(iterator) : state->playerPaths.erase(iterator);
+        }
+        std::erase_if(state->bots,
+                      [&](auto const& entry)
+                      {
+                          return std::none_of(players.begin(), players.end(),
+                                              [&](StreamPlayer const& player) { return player.guid == entry.first; });
+                      });
+        std::vector<StreamCreature> creatures;
+        CollectCreatures(map, *state, nowMs, creatures, paths);
 
         std::string_view const host = telemetryConfig.GetConfigValue(WowMinTelemetryConfig::StreamHost);
         uint32 const port = telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::StreamPort);
         streamSender.Send(BuildStreamDatagrams(map->GetId(), map->GetInstanceId(), sequence, uint32(nowMs), players),
                           host, port);
+        if (!creatures.empty())
+            streamSender.Send(BuildCreatureDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), creatures),
+                              host, port);
+        if (!paths.empty())
+            streamSender.Send(BuildPathDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), paths), host, port);
+        if (!bots.empty())
+            streamSender.Send(BuildBotDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), bots), host, port);
+    }
+
+#ifdef MOD_PLAYERBOTS
+    // Adds what the bot is deciding to `bots` when that has changed, or is due
+    // a refresh.
+    static void CollectBot(Map* map, Player* player, StreamSessionState& state, uint64 nowMs,
+                           std::vector<StreamBot>& bots)
+    {
+        PlayerbotAI* botAI = sPlayerbotsMgr.GetPlayerbotAI(player);
+        AiObjectContext* context = botAI ? botAI->GetAiObjectContext() : nullptr;
+        if (!context)
+            return;
+        uint32 const guid = player->GetGUID().GetCounter();
+        std::shared_ptr<BotActionLog> const log = TrackBotActions(guid, botAI->GetCurrentEngine());
+        auto [iterator, inserted] = state.bots.try_emplace(guid);
+        StreamSessionState::SentBot& sent = iterator->second;
+        if (!inserted && nowMs - sent.sentAtMs < STREAM_BOT_MIN_INTERVAL_MS)
+            return;
+
+        StreamBot bot;
+        bot.guid = guid;
+        BotState const botState = botAI->GetState();
+        bot.state = uint8(botState);
+        MotionMaster* motionMaster = player->GetMotionMaster();
+        if (motionMaster && !motionMaster->empty())
+        {
+            bot.motionType = uint8(motionMaster->GetCurrentMovementGeneratorType());
+            if (auto const* follower = dynamic_cast<AbstractFollower const*>(motionMaster->top()))
+                if (Unit* target = follower->GetTarget())
+                {
+                    bot.motionTargetGuid = target->GetGUID().GetCounter();
+                    if (target->IsPlayer())
+                        bot.flags |= 2;
+                }
+        }
+        ObjectGuid const target = player->GetTarget();
+        bot.targetGuid = target ? target.GetCounter() : 0;
+        if (target.IsPlayer())
+            bot.flags |= 4;
+        uint32 moveSetAt = 0;
+        if (Value<LastMovement&>* lastMovement = context->GetValue<LastMovement&>("last movement"))
+        {
+            LastMovement const& lastMove = lastMovement->Get();
+            bot.movePriority = uint8(lastMove.priority);
+            if (lastMove.msTime && lastMove.lastMoveToMapId == map->GetId() &&
+                (lastMove.lastMoveToX != 0.0f || lastMove.lastMoveToY != 0.0f))
+            {
+                bot.flags |= 1;
+                bot.moveX = lastMove.lastMoveToX;
+                bot.moveY = lastMove.lastMoveToY;
+                bot.moveZ = lastMove.lastMoveToZ;
+                bot.moveAgeMs = getMSTimeDiff(lastMove.msTime, getMSTime());
+                moveSetAt = lastMove.msTime;
+            }
+        }
+        for (std::string const& strategy : botAI->GetStrategies(botState))
+        {
+            if (!bot.strategies.empty())
+                bot.strategies += ',';
+            bot.strategies += strategy;
+        }
+        uint32 revision = 0;
+        if (log)
+        {
+            std::lock_guard<std::mutex> lock(log->mutex);
+            revision = log->revision;
+            for (auto entry = log->entries.rbegin(); entry != log->entries.rend(); ++entry)
+                bot.actions.push_back({entry->name, entry->relevance,
+                                       uint32(std::min<uint64>(nowMs > entry->atMs ? nowMs - entry->atMs : 0,
+                                                               UINT32_MAX)),
+                                       entry->repeats});
+        }
+
+        std::size_t signature = std::hash<std::string>{}(bot.strategies);
+        auto mix = [&](uint64 value)
+        { signature ^= std::hash<uint64>{}(value) + 0x9e3779b97f4a7c15ULL + (signature << 6) + (signature >> 2); };
+        mix(bot.state);
+        mix(bot.motionType);
+        mix(bot.movePriority);
+        mix(bot.flags);
+        mix(bot.motionTargetGuid);
+        mix(bot.targetGuid);
+        mix(moveSetAt);
+        mix(revision);
+        if (!inserted && signature == sent.signature && nowMs - sent.sentAtMs < STREAM_BOT_REFRESH_MS)
+            return;
+        sent = {nowMs, signature};
+        bots.push_back(std::move(bot));
+    }
+#endif
+
+    // Adds the unit's path to `paths` when it has changed since it was last
+    // sent, or is due a refresh.
+    static void CollectPathChange(Unit* unit, uint32 guid, bool creature,
+                                  std::unordered_map<uint32, StreamSessionState::SentPath>& sentPaths, uint64 nowMs,
+                                  std::vector<StreamPath>& paths)
+    {
+        bool truncated = false;
+        std::vector<G3D::Vector3> points = GetRemainingPath(unit, truncated);
+        uint32 const splineId = points.empty() ? 0 : unit->movespline->GetId();
+        StreamSessionState::SentPath& sent = sentPaths[guid];
+        bool const changed = splineId != sent.splineId;
+        if (!changed && (!splineId || nowMs - sent.sentAtMs < STREAM_PATH_REFRESH_MS))
+            return;
+        sent = {splineId, nowMs};
+        uint8 const flags = uint8((truncated ? 1 : 0) | (creature ? 2 : 0));
+        paths.push_back({guid, splineId, flags, std::move(points)});
+    }
+
+    // Adds each creature that moved, changed, or is due a refresh to
+    // `creatures`, and its path to `paths` when that changed.
+    static void CollectCreatures(Map* map, StreamSessionState& state, uint64 nowMs,
+                                 std::vector<StreamCreature>& creatures, std::vector<StreamPath>& paths)
+    {
+        std::vector<Creature*> present;
+        StreamCreatureCollector collector(present);
+        TypeContainerVisitor<StreamCreatureCollector, MapStoredObjectTypesContainer> visitor(collector);
+        visitor.Visit(map->GetObjectsStore());
+
+        std::unordered_set<uint32> seen;
+        for (Creature* creature : present)
+        {
+            if (!creature->IsInWorld() || creature->IsDuringRemoveFromWorld() || creature->IsTrigger() ||
+                creature->IsTotem() || creature->IsCritter())
+                continue;
+            uint32 const guid = creature->GetGUID().GetCounter();
+            seen.insert(guid);
+
+            ObjectGuid const target = creature->GetTarget();
+            uint8 flags = 0;
+            if (creature->IsAlive())
+                flags |= 1;
+            if (creature->IsInCombat())
+                flags |= 2;
+            if (creature->IsHostileToPlayers())
+                flags |= 4;
+            if (creature->IsDungeonBoss() || creature->isWorldBoss())
+                flags |= 8;
+            if (creature->IsControlledByPlayer() || creature->GetCharmerOrOwnerGUID().IsPlayer())
+                flags |= 16;
+            if (target.IsPlayer())
+                flags |= 32;
+            uint32 const targetGuid = target ? target.GetCounter() : 0;
+            uint8 const healthPct = uint8(std::clamp(creature->GetHealthPct(), 0.0f, 100.0f));
+
+            auto [iterator, inserted] = state.creatures.try_emplace(guid);
+            StreamSessionState::SentCreature& sent = iterator->second;
+            float const moved = std::hypot(creature->GetPositionX() - sent.x, creature->GetPositionY() - sent.y,
+                                           creature->GetPositionZ() - sent.z);
+            bool const moving = moved >= STREAM_CREATURE_MOVE_YARDS ||
+                                (creature->movespline->Initialized() && !creature->movespline->Finalized());
+            bool const changed = inserted || moving || flags != sent.flags || healthPct != sent.healthPct ||
+                                 targetGuid != sent.targetGuid;
+            if (changed || nowMs - sent.sentAtMs >= STREAM_CREATURE_REFRESH_MS)
+            {
+                if (inserted || moved >= STREAM_CREATURE_MOVE_YARDS)
+                {
+                    sent.wmoGroupId = GetUnitWmoGroupId(map, creature);
+                    sent.x = creature->GetPositionX();
+                    sent.y = creature->GetPositionY();
+                    sent.z = creature->GetPositionZ();
+                }
+                sent.sentAtMs = nowMs;
+                sent.flags = flags;
+                sent.healthPct = healthPct;
+                sent.targetGuid = targetGuid;
+                creatures.push_back({guid, creature->GetEntry(), creature->GetPositionX(), creature->GetPositionY(),
+                                     creature->GetPositionZ(), creature->GetOrientation(), healthPct, flags, targetGuid,
+                                     sent.wmoGroupId});
+            }
+            CollectPathChange(creature, guid, true, state.creaturePaths, nowMs, paths);
+        }
+        // Forget despawned creatures, so a respawn is sent as new.
+        std::erase_if(state.creatures, [&](auto const& entry) { return !seen.contains(entry.first); });
+        std::erase_if(state.creaturePaths, [&](auto const& entry) { return !seen.contains(entry.first); });
     }
 
     static void CaptureBattleground(BattlegroundMap* map, uint64 sessionKey)
