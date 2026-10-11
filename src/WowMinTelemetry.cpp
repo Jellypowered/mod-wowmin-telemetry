@@ -51,6 +51,7 @@
 #include "StringConvert.h"
 #include "TypeContainerVisitor.h"
 #include "Unit.h"
+#include "Vehicle.h"
 #include "WorldSession.h"
 #include "WorldStatePackets.h"
 
@@ -111,6 +112,7 @@ enum PlayerStateFlags : uint32
     PLAYER_STATE_STUNNED = 1 << 3,
     PLAYER_STATE_SPIRIT_FORM = 1 << 4,
     PLAYER_STATE_FLAG_CARRIER = 1 << 5,
+    PLAYER_STATE_FLYING = 1 << 6,
 };
 constexpr uint32 SPELL_WARSONG_FLAG = 23333;
 constexpr uint32 SPELL_SILVERWING_FLAG = 23335;
@@ -196,6 +198,8 @@ uint32 GetPlayerStateFlags(Player* player)
         stateFlags |= PLAYER_STATE_STUNNED;
     if (player->HasSpiritOfRedemptionAura())
         stateFlags |= PLAYER_STATE_SPIRIT_FORM;
+    if (player->IsFlying())
+        stateFlags |= PLAYER_STATE_FLYING;
     if (player->HasAura(SPELL_WARSONG_FLAG) || player->HasAura(SPELL_SILVERWING_FLAG) ||
         player->HasAura(SPELL_NETHERSTORM_FLAG))
         stateFlags |= PLAYER_STATE_FLAG_CARRIER;
@@ -227,8 +231,9 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //     u16 playerCount, u16 reserved
 //   player (30 bytes + name): u32 guid, f32 x, f32 y, f32 z, f32 orientation,
 //     u8 healthPct, u8 powerPct, i8 powerType, u8 flags (1 alive, 2 in combat,
-//     4 waiting to resurrect), u8 stateFlags, u8 nameLength, i32 wmoGroupId,
-//     name bytes
+//     4 waiting to resurrect), u8 stateFlags (1 on a taxi, 2 mounted, 4 sapped,
+//     8 stunned, 16 spirit form, 32 carrying a flag, 64 flying), u8
+//     nameLength, i32 wmoGroupId, name bytes
 // A snapshot larger than one datagram is split into parts sharing a sequence.
 //
 // Movement paths go in separate datagrams, sent alongside a snapshot when a
@@ -294,6 +299,14 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //   header (24 bytes): "WMU1", then as for paths, with u16 unitCount
 //   unit (8 bytes + auras): u32 guid, u8 flags (1 a creature, not a player),
 //     u8 auraCount, u16 reserved, then auraCount x u32 spell ID
+//
+// Players riding vehicles (Ulduar's demolishers, a passenger seat on a
+// mammoth) go in their own datagrams, with every snapshot while any are, so
+// wowmin can seat or hide them; a player missing from them is on foot.
+//   header (24 bytes): "WMV1", then as for paths, with u16 passengerCount
+//   passenger (12 bytes): u32 guid, u32 vehicleGuid, u8 flags (1 the vehicle
+//     is a creature, not a player, 2 the seat hides its passenger, 4 the
+//     seat drives the vehicle), i8 seat index, u16 reserved
 //
 // Combat events (casts, notable auras, auto-attack swings, damage, and heals)
 // are gathered from the core's hooks as they happen and sent with the next
@@ -548,6 +561,14 @@ struct StreamAppearance
     uint32 nativeDisplayId = 0;
     uint32 mountDisplayId = 0;
     StreamGear gear;
+};
+
+struct StreamPassenger
+{
+    uint32 guid = 0;
+    uint32 vehicleGuid = 0;
+    uint8 flags = 0;
+    int8 seat = 0;
 };
 
 struct StreamUnitAuras
@@ -829,6 +850,24 @@ std::vector<std::vector<uint8>> BuildAppearanceDatagrams(uint32 mapId, uint32 in
         AppendU8(entry, appearance.gear.rangedSubclass);
     }
     return PackEntries("WMA1", mapId, instanceId, serverTimeMs, entries);
+}
+
+std::vector<std::vector<uint8>> BuildPassengerDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
+                                                        std::vector<StreamPassenger> const& passengers)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(passengers.size());
+    for (StreamPassenger const& passenger : passengers)
+    {
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(12);
+        AppendU32(entry, passenger.guid);
+        AppendU32(entry, passenger.vehicleGuid);
+        AppendU8(entry, passenger.flags);
+        AppendU8(entry, uint8(passenger.seat));
+        AppendU16(entry, 0);
+    }
+    return PackEntries("WMV1", mapId, instanceId, serverTimeMs, entries);
 }
 
 std::vector<std::vector<uint8>> BuildUnitAuraDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
@@ -1578,6 +1617,7 @@ private:
         std::vector<StreamBot> bots;
         std::vector<StreamAppearance> appearances;
         std::vector<StreamUnitAuras> unitAuras;
+        std::vector<StreamPassenger> passengers;
         for (auto const& playerReference : map->GetPlayers())
         {
             Player* player = playerReference.GetSource();
@@ -1604,6 +1644,7 @@ private:
                                GetUnitWmoGroupId(map, player),
                                player->GetName()});
             CollectPathChange(player, player->GetGUID().GetCounter(), false, state->playerPaths, nowMs, paths);
+            CollectPassenger(player, passengers);
             CollectAppearance(player, *state, nowMs, appearances);
             CollectAuras(player, *state, nowMs, unitAuras);
 #ifdef MOD_PLAYERBOTS
@@ -1653,6 +1694,9 @@ private:
                               host, port);
         if (!unitAuras.empty())
             streamSender.Send(BuildUnitAuraDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), unitAuras),
+                              host, port);
+        if (!passengers.empty())
+            streamSender.Send(BuildPassengerDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), passengers),
                               host, port);
         std::vector<StreamCombatEvent> events;
         uint32 droppedEvents = 0;
@@ -1763,6 +1807,24 @@ private:
 
     // Adds the unit's art auras to `unitAuras` when they have changed, or are
     // due a refresh; a unit with none is sent only as its last one goes.
+    // Adds the player to `passengers` if they ride a vehicle.
+    static void CollectPassenger(Player* player, std::vector<StreamPassenger>& passengers)
+    {
+        Vehicle* vehicle = player->GetVehicle();
+        Unit* base = vehicle ? vehicle->GetBase() : nullptr;
+        if (!base)
+            return;
+        uint8 flags = base->IsPlayer() ? 0 : 1;
+        if (VehicleSeatEntry const* seat = vehicle->GetSeatForPassenger(player))
+        {
+            if (seat->m_flags & VEHICLE_SEAT_FLAG_HIDE_PASSENGER)
+                flags |= 2;
+            if (seat->m_flags & VEHICLE_SEAT_FLAG_CAN_CONTROL)
+                flags |= 4;
+        }
+        passengers.push_back({player->GetGUID().GetCounter(), base->GetGUID().GetCounter(), flags, player->GetTransSeat()});
+    }
+
     static void CollectAuras(Unit* unit, StreamSessionState& state, uint64 nowMs, std::vector<StreamUnitAuras>& unitAuras)
     {
         StreamUnitAuras auras{unit->GetGUID().GetCounter(), !unit->IsPlayer(), {}};
