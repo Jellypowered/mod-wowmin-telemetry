@@ -31,6 +31,7 @@
 #include "Creature.h"
 #include "ConfigValueCache.h"
 #include "DBCStores.h"
+#include "GameObject.h"
 #include "GameTime.h"
 #include "Group.h"
 #include "InstanceScript.h"
@@ -308,6 +309,16 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //     is a creature, not a player, 2 the seat hides its passenger, 4 the
 //     seat drives the vehicle), i8 seat index, u16 reserved
 //
+// Game objects with a model (battleground banners and flags, doors, chests)
+// go in their own datagrams too, whenever one appears or changes and every
+// STREAM_GAMEOBJECT_REFRESH_MS otherwise; one that despawns is sent once
+// marked gone. Objects without a model and spell foci are left out.
+//   header (24 bytes): "WMG1", then as for paths, with u16 objectCount
+//   object (48 bytes): u32 guid, u32 entry, u32 displayId, f32 x, f32 y,
+//     f32 z, f32 rotation x, y, z, w (a quaternion), u16 scale (x 1000), u8
+//     type (GameobjectTypes), u8 state (GOState: 0 active, e.g. a door open,
+//     1 ready, 2 alternative), u8 flags (1 gone), u8 reserved x3
+//
 // Combat events (casts, notable auras, auto-attack swings, damage, and heals)
 // are gathered from the core's hooks as they happen and sent with the next
 // snapshot, at most STREAM_MAX_EVENTS per snapshot; the header's reserved u16
@@ -350,6 +361,7 @@ constexpr std::size_t STREAM_MAX_ACTION_NAME = 48;
 // Actions kept per bot; a run of the same action counts as one.
 constexpr std::size_t BOT_ACTION_HISTORY = 6;
 constexpr uint64 STREAM_APPEARANCE_REFRESH_MS = 5000;
+constexpr uint64 STREAM_GAMEOBJECT_REFRESH_MS = 10000;
 // Gear is read when a unit is first seen and after a player equips or
 // unequips something; this re-read catches anything those hooks miss.
 constexpr uint64 STREAM_GEAR_REFRESH_MS = 60000;
@@ -484,6 +496,7 @@ struct StreamSessionState
     std::unordered_map<uint64, SentAppearance> appearances;
     // Signature 0 means the unit was last sent (or seen) with no art auras.
     std::unordered_map<uint64, SentSignature> auras;
+    std::unordered_map<uint32, SentSignature> gameObjects;
     // Filled by the combat hooks and emptied by each snapshot. The hooks
     // normally run on the session's map thread, but take no chances.
     std::mutex eventMutex;
@@ -561,6 +574,21 @@ struct StreamAppearance
     uint32 nativeDisplayId = 0;
     uint32 mountDisplayId = 0;
     StreamGear gear;
+};
+
+struct StreamGameObject
+{
+    uint32 guid = 0;
+    uint32 entry = 0;
+    uint32 displayId = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    std::array<float, 4> rotation{0.0f, 0.0f, 0.0f, 1.0f};
+    uint16 scale = 1000;
+    uint8 type = 0;
+    uint8 state = 0;
+    bool gone = false;
 };
 
 struct StreamPassenger
@@ -852,6 +880,33 @@ std::vector<std::vector<uint8>> BuildAppearanceDatagrams(uint32 mapId, uint32 in
     return PackEntries("WMA1", mapId, instanceId, serverTimeMs, entries);
 }
 
+std::vector<std::vector<uint8>> BuildGameObjectDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
+                                                         std::vector<StreamGameObject> const& objects)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(objects.size());
+    for (StreamGameObject const& object : objects)
+    {
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(48);
+        AppendU32(entry, object.guid);
+        AppendU32(entry, object.entry);
+        AppendU32(entry, object.displayId);
+        AppendF32(entry, object.x);
+        AppendF32(entry, object.y);
+        AppendF32(entry, object.z);
+        for (float component : object.rotation)
+            AppendF32(entry, component);
+        AppendU16(entry, object.scale);
+        AppendU8(entry, object.type);
+        AppendU8(entry, object.state);
+        AppendU8(entry, object.gone ? 1 : 0);
+        AppendU8(entry, 0);
+        AppendU16(entry, 0);
+    }
+    return PackEntries("WMG1", mapId, instanceId, serverTimeMs, entries);
+}
+
 std::vector<std::vector<uint8>> BuildPassengerDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
                                                         std::vector<StreamPassenger> const& passengers)
 {
@@ -1029,6 +1084,24 @@ std::shared_ptr<BotActionLog> TrackBotActions(uint32 guid, Engine* engine)
 #endif
 
 // Collects the creatures in a map's object store (spawns, summons, and pets).
+class StreamGameObjectCollector
+{
+public:
+    explicit StreamGameObjectCollector(std::vector<GameObject*>& objects) : _objects(objects) {}
+
+    void Visit(std::unordered_map<ObjectGuid, GameObject*>& objectMap)
+    {
+        for (auto const& [guid, object] : objectMap)
+            _objects.push_back(object);
+    }
+
+    template<class T>
+    void Visit(std::unordered_map<ObjectGuid, T*>&) {}
+
+private:
+    std::vector<GameObject*>& _objects;
+};
+
 class StreamCreatureCollector
 {
 public:
@@ -1667,6 +1740,8 @@ private:
                       });
         std::vector<StreamCreature> creatures;
         CollectCreatures(map, *state, nowMs, creatures, paths, appearances, unitAuras);
+        std::vector<StreamGameObject> gameObjects;
+        CollectGameObjects(map, *state, nowMs, gameObjects);
         // Forget units that have gone, so a return is sent as new.
         auto gone = [&](auto const& entry)
         {
@@ -1697,6 +1772,9 @@ private:
                               host, port);
         if (!passengers.empty())
             streamSender.Send(BuildPassengerDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), passengers),
+                              host, port);
+        if (!gameObjects.empty())
+            streamSender.Send(BuildGameObjectDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), gameObjects),
                               host, port);
         std::vector<StreamCombatEvent> events;
         uint32 droppedEvents = 0;
@@ -1807,6 +1885,65 @@ private:
 
     // Adds the unit's art auras to `unitAuras` when they have changed, or are
     // due a refresh; a unit with none is sent only as its last one goes.
+    // Adds each spawned game object with a model that appeared, changed, or is
+    // due a refresh to `objects`, and one marked gone for each that went.
+    static void CollectGameObjects(Map* map, StreamSessionState& state, uint64 nowMs, std::vector<StreamGameObject>& objects)
+    {
+        std::vector<GameObject*> present;
+        StreamGameObjectCollector collector(present);
+        TypeContainerVisitor<StreamGameObjectCollector, MapStoredObjectTypesContainer> visitor(collector);
+        visitor.Visit(map->GetObjectsStore());
+
+        std::unordered_set<uint32> seen;
+        for (GameObject* object : present)
+        {
+            if (!object->IsInWorld() || !object->isSpawned() || !object->GetDisplayId())
+                continue;
+            GameobjectTypes const type = object->GetGoType();
+            // Spell foci are invisible markers; traps can have a model (the glow
+            // under an Arathi Basin banner), so only those without one go.
+            if (type == GAMEOBJECT_TYPE_SPELL_FOCUS)
+                continue;
+            uint32 const guid = object->GetGUID().GetCounter();
+            seen.insert(guid);
+            G3D::Quat const rotation = object->GetWorldRotation();
+            StreamGameObject entry{guid, object->GetEntry(), object->GetDisplayId(), object->GetPositionX(),
+                                   object->GetPositionY(), object->GetPositionZ(),
+                                   {rotation.x, rotation.y, rotation.z, rotation.w},
+                                   uint16(std::clamp(object->GetObjectScale() * 1000.0f, 0.0f, 65535.0f)),
+                                   uint8(type), uint8(object->GetGoState()), false};
+            std::size_t signature = std::hash<uint32>{}(entry.displayId);
+            auto mix = [&](auto value) { signature ^= std::hash<decltype(value)>{}(value) + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2); };
+            mix(entry.state);
+            mix(entry.scale);
+            mix(int32(entry.x * 10.0f));
+            mix(int32(entry.y * 10.0f));
+            mix(int32(entry.z * 10.0f));
+            mix(int32(rotation.w * 1000.0f));
+            mix(int32(rotation.z * 1000.0f));
+            auto [iterator, inserted] = state.gameObjects.try_emplace(guid);
+            StreamSessionState::SentSignature& sent = iterator->second;
+            if (!inserted && sent.signature == signature && nowMs - sent.sentAtMs < STREAM_GAMEOBJECT_REFRESH_MS)
+                continue;
+            sent = {nowMs, signature};
+            objects.push_back(entry);
+        }
+        // Gone since the last tick: sent once, then forgotten.
+        for (auto iterator = state.gameObjects.begin(); iterator != state.gameObjects.end();)
+        {
+            if (seen.contains(iterator->first))
+            {
+                ++iterator;
+                continue;
+            }
+            StreamGameObject gone;
+            gone.guid = iterator->first;
+            gone.gone = true;
+            objects.push_back(gone);
+            iterator = state.gameObjects.erase(iterator);
+        }
+    }
+
     // Adds the player to `passengers` if they ride a vehicle.
     static void CollectPassenger(Player* player, std::vector<StreamPassenger>& passengers)
     {
