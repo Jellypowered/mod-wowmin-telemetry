@@ -250,7 +250,8 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //   creature (36 bytes): u32 guid, u32 entry, f32 x, f32 y, f32 z,
 //     f32 orientation, u8 healthPct, u8 flags (1 alive, 2 in combat, 4 hostile
 //     to players, 8 boss, 16 controlled by a player, e.g. a pet, 32 its target
-//     is a player), u16 reserved, u32 targetGuid (0: none), i32 wmoGroupId
+//     is a player, 64 scenery: see IsScenery; its path isn't sent), u16
+//     reserved, u32 targetGuid (0: none), i32 wmoGroupId
 //
 // With mod-playerbots, what each bot is deciding goes in its own datagrams
 // too: whenever it changes (at most every STREAM_BOT_MIN_INTERVAL_MS) and
@@ -1905,6 +1906,18 @@ private:
         paths.push_back({guid, splineId, flags, std::move(points)});
     }
 
+    // Scenery: a creature players can't select (Arathi Basin's workers), or,
+    // outside a fight, one they can neither attack nor talk to. wowmin draws
+    // it without a ring, facing, or path, so its path isn't sent.
+    static bool IsScenery(Creature* creature)
+    {
+        if (creature->HasUnitFlag(UNIT_FLAG_NOT_SELECTABLE))
+            return true;
+        if (creature->IsInCombat() || creature->GetNpcFlags() != UNIT_NPC_FLAG_NONE)
+            return false;
+        return creature->HasUnitFlag(UNIT_FLAG_NON_ATTACKABLE) || creature->HasUnitFlag(UNIT_FLAG_IMMUNE_TO_PC);
+    }
+
     // Adds each creature that moved, changed, or is due a refresh to
     // `creatures`, and its path to `paths` when that changed.
     static void CollectCreatures(Map* map, StreamSessionState& state, uint64 nowMs,
@@ -1939,6 +1952,9 @@ private:
                 flags |= 16;
             if (target.IsPlayer())
                 flags |= 32;
+            bool const scenery = IsScenery(creature);
+            if (scenery)
+                flags |= 64;
             uint32 const targetGuid = target ? target.GetCounter() : 0;
             uint8 const healthPct = uint8(std::clamp(creature->GetHealthPct(), 0.0f, 100.0f));
 
@@ -1967,7 +1983,8 @@ private:
                                      creature->GetPositionZ(), creature->GetOrientation(), healthPct, flags, targetGuid,
                                      sent.wmoGroupId});
             }
-            CollectPathChange(creature, guid, true, state.creaturePaths, nowMs, paths);
+            if (!scenery)
+                CollectPathChange(creature, guid, true, state.creaturePaths, nowMs, paths);
             CollectAppearance(creature, state, nowMs, appearances);
             CollectAuras(creature, state, nowMs, unitAuras);
         }
