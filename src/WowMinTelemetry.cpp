@@ -319,6 +319,23 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //     type (GameobjectTypes), u8 state (GOState: 0 active, e.g. a door open,
 //     1 ready, 2 alternative), u8 flags (1 gone), u8 reserved x3
 //
+// The harmful auras on each unit (for wowmin's nameplates) go in their own
+// datagrams: when a unit's list changes and every STREAM_DEBUFF_REFRESH_MS
+// while it isn't empty; a unit whose last one goes is sent once with none.
+// At most STREAM_MAX_DEBUFFS a unit, from those with an aura slot.
+//   header (24 bytes): "WMD1", then as for paths, with u16 unitCount
+//   unit (8 bytes + debuffs): u32 guid, u8 flags (1 a creature), u8
+//     debuffCount, u16 reserved, then debuffCount x (u32 spellId, u32
+//     remainingMs (0: lasts until removed), u32 durationMs, u8 stacks, u8
+//     flags (1 cast by a player), u16 reserved)
+//
+// The raid markers (skull, cross, ...) the session's groups have set go in
+// their own datagram when they change and every STREAM_MARKER_REFRESH_MS
+// while any are set; once all are cleared it is sent once empty.
+//   header (24 bytes): "WMR1", then as for paths, with u16 markerCount
+//   marker (8 bytes): u8 icon (0 star .. 7 skull), u8 flags (1 the target is
+//     a creature), u16 reserved, u32 guid
+//
 // Combat events (casts, notable auras, auto-attack swings, damage, and heals)
 // are gathered from the core's hooks as they happen and sent with the next
 // snapshot, at most STREAM_MAX_EVENTS per snapshot; the header's reserved u16
@@ -362,6 +379,9 @@ constexpr std::size_t STREAM_MAX_ACTION_NAME = 48;
 constexpr std::size_t BOT_ACTION_HISTORY = 6;
 constexpr uint64 STREAM_APPEARANCE_REFRESH_MS = 5000;
 constexpr uint64 STREAM_GAMEOBJECT_REFRESH_MS = 10000;
+constexpr uint64 STREAM_DEBUFF_REFRESH_MS = 3000;
+constexpr std::size_t STREAM_MAX_DEBUFFS = 6;
+constexpr uint64 STREAM_MARKER_REFRESH_MS = 2000;
 // Gear is read when a unit is first seen and after a player equips or
 // unequips something; this re-read catches anything those hooks miss.
 constexpr uint64 STREAM_GEAR_REFRESH_MS = 60000;
@@ -497,6 +517,8 @@ struct StreamSessionState
     // Signature 0 means the unit was last sent (or seen) with no art auras.
     std::unordered_map<uint64, SentSignature> auras;
     std::unordered_map<uint32, SentSignature> gameObjects;
+    std::unordered_map<uint64, SentSignature> debuffs;
+    SentSignature markers;
     // Filled by the combat hooks and emptied by each snapshot. The hooks
     // normally run on the session's map thread, but take no chances.
     std::mutex eventMutex;
@@ -574,6 +596,29 @@ struct StreamAppearance
     uint32 nativeDisplayId = 0;
     uint32 mountDisplayId = 0;
     StreamGear gear;
+};
+
+struct StreamDebuff
+{
+    uint32 spellId = 0;
+    uint32 remainingMs = 0;
+    uint32 durationMs = 0;
+    uint8 stacks = 0;
+    bool fromPlayer = false;
+};
+
+struct StreamUnitDebuffs
+{
+    uint32 guid = 0;
+    bool creature = false;
+    std::vector<StreamDebuff> debuffs;
+};
+
+struct StreamMarker
+{
+    uint8 icon = 0;
+    bool creature = false;
+    uint32 guid = 0;
 };
 
 struct StreamGameObject
@@ -878,6 +923,63 @@ std::vector<std::vector<uint8>> BuildAppearanceDatagrams(uint32 mapId, uint32 in
         AppendU8(entry, appearance.gear.rangedSubclass);
     }
     return PackEntries("WMA1", mapId, instanceId, serverTimeMs, entries);
+}
+
+std::vector<std::vector<uint8>> BuildDebuffDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
+                                                     std::vector<StreamUnitDebuffs> const& units)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(units.size());
+    for (StreamUnitDebuffs const& unit : units)
+    {
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(8 + unit.debuffs.size() * 16);
+        AppendU32(entry, unit.guid);
+        AppendU8(entry, unit.creature ? 1 : 0);
+        AppendU8(entry, uint8(unit.debuffs.size()));
+        AppendU16(entry, 0);
+        for (StreamDebuff const& debuff : unit.debuffs)
+        {
+            AppendU32(entry, debuff.spellId);
+            AppendU32(entry, debuff.remainingMs);
+            AppendU32(entry, debuff.durationMs);
+            AppendU8(entry, debuff.stacks);
+            AppendU8(entry, debuff.fromPlayer ? 1 : 0);
+            AppendU16(entry, 0);
+        }
+    }
+    return PackEntries("WMD1", mapId, instanceId, serverTimeMs, entries);
+}
+
+std::vector<std::vector<uint8>> BuildMarkerDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
+                                                     std::vector<StreamMarker> const& markers)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(markers.size());
+    for (StreamMarker const& marker : markers)
+    {
+        std::vector<uint8>& entry = entries.emplace_back();
+        AppendU8(entry, marker.icon);
+        AppendU8(entry, marker.creature ? 1 : 0);
+        AppendU16(entry, 0);
+        AppendU32(entry, marker.guid);
+    }
+    std::vector<std::vector<uint8>> datagrams = PackEntries("WMR1", mapId, instanceId, serverTimeMs, entries);
+    // All markers cleared: one empty datagram says so.
+    if (datagrams.empty())
+    {
+        std::vector<uint8>& datagram = datagrams.emplace_back();
+        datagram.insert(datagram.end(), {'W', 'M', 'R', '1'});
+        AppendU8(datagram, STREAM_VERSION);
+        AppendU8(datagram, 0);
+        AppendU16(datagram, 0);
+        AppendU32(datagram, mapId);
+        AppendU32(datagram, instanceId);
+        AppendU32(datagram, serverTimeMs);
+        AppendU16(datagram, 0);
+        AppendU16(datagram, 0);
+    }
+    return datagrams;
 }
 
 std::vector<std::vector<uint8>> BuildGameObjectDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
@@ -1690,6 +1792,7 @@ private:
         std::vector<StreamBot> bots;
         std::vector<StreamAppearance> appearances;
         std::vector<StreamUnitAuras> unitAuras;
+        std::vector<StreamUnitDebuffs> debuffs;
         std::vector<StreamPassenger> passengers;
         for (auto const& playerReference : map->GetPlayers())
         {
@@ -1720,6 +1823,7 @@ private:
             CollectPassenger(player, passengers);
             CollectAppearance(player, *state, nowMs, appearances);
             CollectAuras(player, *state, nowMs, unitAuras);
+            CollectDebuffs(player, *state, nowMs, debuffs);
 #ifdef MOD_PLAYERBOTS
             if (player->GetSession() && player->GetSession()->IsHeadless())
                 CollectBot(map, player, *state, nowMs, bots);
@@ -1739,7 +1843,9 @@ private:
                                               [&](StreamPlayer const& player) { return player.guid == entry.first; });
                       });
         std::vector<StreamCreature> creatures;
-        CollectCreatures(map, *state, nowMs, creatures, paths, appearances, unitAuras);
+        CollectCreatures(map, *state, nowMs, creatures, paths, appearances, unitAuras, debuffs);
+        std::vector<StreamMarker> markers;
+        bool const sendMarkers = CollectMarkers(map, *state, nowMs, markers);
         std::vector<StreamGameObject> gameObjects;
         CollectGameObjects(map, *state, nowMs, gameObjects);
         // Forget units that have gone, so a return is sent as new.
@@ -1752,6 +1858,7 @@ private:
         };
         std::erase_if(state->appearances, gone);
         std::erase_if(state->auras, gone);
+        std::erase_if(state->debuffs, gone);
 
         std::string_view const host = telemetryConfig.GetConfigValue(WowMinTelemetryConfig::StreamHost);
         uint32 const port = telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::StreamPort);
@@ -1776,6 +1883,10 @@ private:
         if (!gameObjects.empty())
             streamSender.Send(BuildGameObjectDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), gameObjects),
                               host, port);
+        if (!debuffs.empty())
+            streamSender.Send(BuildDebuffDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), debuffs), host, port);
+        if (sendMarkers)
+            streamSender.Send(BuildMarkerDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), markers), host, port);
         std::vector<StreamCombatEvent> events;
         uint32 droppedEvents = 0;
         {
@@ -1962,6 +2073,78 @@ private:
         passengers.push_back({player->GetGUID().GetCounter(), base->GetGUID().GetCounter(), flags, player->GetTransSeat()});
     }
 
+    // Adds the unit's harmful auras to `units` when the list changed (spells or
+    // stacks), or is due a refresh while it isn't empty.
+    static void CollectDebuffs(Unit* unit, StreamSessionState& state, uint64 nowMs, std::vector<StreamUnitDebuffs>& units)
+    {
+        StreamUnitDebuffs entry{unit->GetGUID().GetCounter(), !unit->IsPlayer(), {}};
+        std::size_t signature = 0;
+        for (auto const& [spellId, application] : unit->GetAppliedAuras())
+        {
+            if (entry.debuffs.size() >= STREAM_MAX_DEBUFFS)
+                break;
+            if (!application || application->GetSlot() >= MAX_AURAS || application->IsPositive() || !application->GetBase())
+                continue;
+            Aura const* aura = application->GetBase();
+            if (aura->GetSpellInfo()->IsPassive())
+                continue;
+            int32 const remaining = aura->GetDuration();
+            int32 const duration = aura->GetMaxDuration();
+            entry.debuffs.push_back({aura->GetId(), uint32(std::max(0, remaining)), uint32(std::max(0, duration)),
+                                     aura->GetStackAmount(), aura->GetCasterGUID().IsPlayer()});
+            signature ^= std::hash<uint32>{}(aura->GetId() * 31u + aura->GetStackAmount()) + 0x9e3779b97f4a7c15ull +
+                         (signature << 6) + (signature >> 2);
+        }
+        if (!entry.debuffs.empty() && !signature)
+            signature = 1;
+        uint64 const key = entry.guid | (entry.creature ? uint64(1) << 32 : 0);
+        auto [iterator, inserted] = state.debuffs.try_emplace(key);
+        StreamSessionState::SentSignature& sent = iterator->second;
+        bool const changed = sent.signature != signature;
+        bool const due = signature && nowMs - sent.sentAtMs >= STREAM_DEBUFF_REFRESH_MS;
+        if ((inserted && !signature) || (!changed && !due))
+            return;
+        sent = {nowMs, signature};
+        units.push_back(std::move(entry));
+    }
+
+    // Fills `markers` with the raid markers the session's groups have set;
+    // true when they should be sent (changed, or due a refresh while any are).
+    static bool CollectMarkers(Map* map, StreamSessionState& state, uint64 nowMs, std::vector<StreamMarker>& markers)
+    {
+        std::unordered_set<Group*> groups;
+        for (auto const& playerReference : map->GetPlayers())
+            if (Player* player = playerReference.GetSource())
+                if (Group* group = player->GetGroup())
+                    groups.insert(group);
+        std::size_t signature = 0;
+        for (Group* group : groups)
+        {
+            for (uint8 icon = 0; icon < TARGETICONCOUNT; ++icon)
+            {
+                ObjectGuid const target = group->GetTargetIcon(icon);
+                if (!target)
+                    continue;
+                bool const duplicate = std::any_of(markers.begin(), markers.end(), [&](StreamMarker const& marker)
+                    { return marker.icon == icon && marker.guid == target.GetCounter(); });
+                if (duplicate)
+                    continue;
+                markers.push_back({icon, !target.IsPlayer(), target.GetCounter()});
+                signature ^= std::hash<uint64>{}(target.GetRawValue() + icon) + 0x9e3779b97f4a7c15ull + (signature << 6) +
+                             (signature >> 2);
+            }
+        }
+        if (!markers.empty() && !signature)
+            signature = 1;
+        StreamSessionState::SentSignature& sent = state.markers;
+        bool const changed = sent.signature != signature;
+        bool const due = signature && nowMs - sent.sentAtMs >= STREAM_MARKER_REFRESH_MS;
+        if (!changed && !due)
+            return false;
+        sent = {nowMs, signature};
+        return true;
+    }
+
     static void CollectAuras(Unit* unit, StreamSessionState& state, uint64 nowMs, std::vector<StreamUnitAuras>& unitAuras)
     {
         StreamUnitAuras auras{unit->GetGUID().GetCounter(), !unit->IsPlayer(), {}};
@@ -2121,7 +2304,8 @@ private:
     // `creatures`, and its path to `paths` when that changed.
     static void CollectCreatures(Map* map, StreamSessionState& state, uint64 nowMs,
                                  std::vector<StreamCreature>& creatures, std::vector<StreamPath>& paths,
-                                 std::vector<StreamAppearance>& appearances, std::vector<StreamUnitAuras>& unitAuras)
+                                 std::vector<StreamAppearance>& appearances, std::vector<StreamUnitAuras>& unitAuras,
+                                 std::vector<StreamUnitDebuffs>& debuffs)
     {
         std::vector<Creature*> present;
         StreamCreatureCollector collector(present);
@@ -2186,6 +2370,7 @@ private:
                 CollectPathChange(creature, guid, true, state.creaturePaths, nowMs, paths);
             CollectAppearance(creature, state, nowMs, appearances);
             CollectAuras(creature, state, nowMs, unitAuras);
+            CollectDebuffs(creature, state, nowMs, debuffs);
         }
         // Forget despawned creatures, so a respawn is sent as new.
         std::erase_if(state.creatures, [&](auto const& entry) { return !seen.contains(entry.first); });
