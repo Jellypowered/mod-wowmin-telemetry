@@ -298,6 +298,38 @@ constexpr std::size_t STREAM_MAX_ACTION_NAME = 48;
 // Actions kept per bot; a run of the same action counts as one.
 constexpr std::size_t BOT_ACTION_HISTORY = 6;
 constexpr uint64 STREAM_APPEARANCE_REFRESH_MS = 5000;
+// Gear is read when a unit is first seen and after a player equips or
+// unequips something; this re-read catches anything those hooks miss.
+constexpr uint64 STREAM_GEAR_REFRESH_MS = 60000;
+
+// What a unit wears: item display IDs by equipment slot, and the weapon types
+// that choose its attack animation.
+struct StreamGear
+{
+    std::array<uint32, EQUIPMENT_SLOT_END> items{};
+    uint8 mainHandType = 0;
+    uint8 mainHandSubclass = 0;
+    uint8 offHandType = 0;
+    uint8 rangedSubclass = 0;
+};
+
+// Bumped when a player equips or unequips something, so streams re-read that
+// player's gear. Equip hooks can run outside the map thread.
+std::mutex gearRevisionMutex;
+std::unordered_map<uint32, uint32> gearRevisions;
+
+uint32 GetGearRevision(uint32 guid)
+{
+    std::lock_guard<std::mutex> lock(gearRevisionMutex);
+    auto const iterator = gearRevisions.find(guid);
+    return iterator == gearRevisions.end() ? 0 : iterator->second;
+}
+
+void BumpGearRevision(uint32 guid)
+{
+    std::lock_guard<std::mutex> lock(gearRevisionMutex);
+    ++gearRevisions[guid];
+}
 
 // What was last sent for each path and creature, keyed by guid. Only the
 // session's map thread uses it.
@@ -328,8 +360,17 @@ struct StreamSessionState
     };
     std::unordered_map<uint32, SentCreature> creatures;
     std::unordered_map<uint32, SentSignature> bots;
+    struct SentAppearance
+    {
+        uint64 sentAtMs = 0;
+        std::size_t signature = 0;
+        bool gearRead = false;
+        uint64 gearReadAtMs = 0;
+        uint32 gearRevision = 0;
+        StreamGear gear;
+    };
     // Keyed by guid, with bit 32 set for creatures.
-    std::unordered_map<uint64, SentSignature> appearances;
+    std::unordered_map<uint64, SentAppearance> appearances;
 };
 
 struct StreamSubscription
@@ -398,11 +439,7 @@ struct StreamAppearance
     uint32 displayId = 0;
     uint32 nativeDisplayId = 0;
     uint32 mountDisplayId = 0;
-    std::array<uint32, EQUIPMENT_SLOT_END> items{};
-    uint8 mainHandType = 0;
-    uint8 mainHandSubclass = 0;
-    uint8 offHandType = 0;
-    uint8 rangedSubclass = 0;
+    StreamGear gear;
 };
 
 struct StreamBotAction
@@ -653,7 +690,7 @@ std::vector<std::vector<uint8>> BuildAppearanceDatagrams(uint32 mapId, uint32 in
     for (StreamAppearance const& appearance : appearances)
     {
         std::vector<uint8>& entry = entries.emplace_back();
-        entry.reserve(32 + appearance.items.size() * 4);
+        entry.reserve(32 + appearance.gear.items.size() * 4);
         AppendU32(entry, appearance.guid);
         AppendU8(entry, appearance.flags);
         AppendU8(entry, appearance.race);
@@ -669,12 +706,12 @@ std::vector<std::vector<uint8>> BuildAppearanceDatagrams(uint32 mapId, uint32 in
         AppendU32(entry, appearance.displayId);
         AppendU32(entry, appearance.nativeDisplayId);
         AppendU32(entry, appearance.mountDisplayId);
-        for (uint32 item : appearance.items)
+        for (uint32 item : appearance.gear.items)
             AppendU32(entry, item);
-        AppendU8(entry, appearance.mainHandType);
-        AppendU8(entry, appearance.mainHandSubclass);
-        AppendU8(entry, appearance.offHandType);
-        AppendU8(entry, appearance.rangedSubclass);
+        AppendU8(entry, appearance.gear.mainHandType);
+        AppendU8(entry, appearance.gear.mainHandSubclass);
+        AppendU8(entry, appearance.gear.offHandType);
+        AppendU8(entry, appearance.gear.rangedSubclass);
     }
     return PackEntries("WMA1", mapId, instanceId, serverTimeMs, entries);
 }
@@ -1437,8 +1474,38 @@ private:
                               host, port);
     }
 
+    // What the unit wears: the visible entry for players, so transmogrification
+    // shows; creatures only have weapon slots.
+    static StreamGear ReadGear(Unit* unit)
+    {
+        StreamGear gear;
+        for (uint8 slot = 0; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            uint32 itemEntry = 0;
+            if (unit->IsPlayer())
+                itemEntry = unit->GetUInt32Value(PLAYER_VISIBLE_ITEM_1_ENTRYID + slot * 2);
+            else if (slot >= EQUIPMENT_SLOT_MAINHAND && slot <= EQUIPMENT_SLOT_RANGED)
+                itemEntry = unit->GetUInt32Value(UNIT_VIRTUAL_ITEM_SLOT_ID + slot - EQUIPMENT_SLOT_MAINHAND);
+            ItemTemplate const* itemTemplate = GetItemTemplate(itemEntry);
+            if (!itemTemplate)
+                continue;
+            gear.items[slot] = itemTemplate->DisplayInfoID;
+            if (slot == EQUIPMENT_SLOT_MAINHAND)
+            {
+                gear.mainHandType = uint8(itemTemplate->InventoryType);
+                gear.mainHandSubclass = uint8(itemTemplate->SubClass);
+            }
+            else if (slot == EQUIPMENT_SLOT_OFFHAND)
+                gear.offHandType = uint8(itemTemplate->InventoryType);
+            else if (slot == EQUIPMENT_SLOT_RANGED)
+                gear.rangedSubclass = uint8(itemTemplate->SubClass);
+        }
+        return gear;
+    }
+
     // Adds how the unit looks to `appearances` when that has changed, or is
-    // due a refresh.
+    // due a refresh. Display, sheath, and scale are read every tick (they
+    // change in combat); gear comes from the session's cache.
     static void CollectAppearance(Unit* unit, StreamSessionState& state, uint64 nowMs,
                                   std::vector<StreamAppearance>& appearances)
     {
@@ -1466,29 +1533,18 @@ private:
         }
         else
             appearance.flags |= 1;
-        for (uint8 slot = 0; slot < EQUIPMENT_SLOT_END; ++slot)
+        uint64 const key = appearance.guid | (unit->IsPlayer() ? 0 : uint64(1) << 32);
+        auto [iterator, inserted] = state.appearances.try_emplace(key);
+        StreamSessionState::SentAppearance& sent = iterator->second;
+        uint32 const gearRevision = unit->IsPlayer() ? GetGearRevision(appearance.guid) : 0;
+        if (!sent.gearRead || gearRevision != sent.gearRevision || nowMs - sent.gearReadAtMs >= STREAM_GEAR_REFRESH_MS)
         {
-            // The visible entry, so transmogrification shows; creatures only
-            // have weapon slots.
-            uint32 itemEntry = 0;
-            if (unit->IsPlayer())
-                itemEntry = unit->GetUInt32Value(PLAYER_VISIBLE_ITEM_1_ENTRYID + slot * 2);
-            else if (slot >= EQUIPMENT_SLOT_MAINHAND && slot <= EQUIPMENT_SLOT_RANGED)
-                itemEntry = unit->GetUInt32Value(UNIT_VIRTUAL_ITEM_SLOT_ID + slot - EQUIPMENT_SLOT_MAINHAND);
-            ItemTemplate const* itemTemplate = GetItemTemplate(itemEntry);
-            if (!itemTemplate)
-                continue;
-            appearance.items[slot] = itemTemplate->DisplayInfoID;
-            if (slot == EQUIPMENT_SLOT_MAINHAND)
-            {
-                appearance.mainHandType = uint8(itemTemplate->InventoryType);
-                appearance.mainHandSubclass = uint8(itemTemplate->SubClass);
-            }
-            else if (slot == EQUIPMENT_SLOT_OFFHAND)
-                appearance.offHandType = uint8(itemTemplate->InventoryType);
-            else if (slot == EQUIPMENT_SLOT_RANGED)
-                appearance.rangedSubclass = uint8(itemTemplate->SubClass);
+            sent.gear = ReadGear(unit);
+            sent.gearRead = true;
+            sent.gearReadAtMs = nowMs;
+            sent.gearRevision = gearRevision;
         }
+        appearance.gear = sent.gear;
 
         std::size_t signature = 0;
         auto mix = [&](uint64 value)
@@ -1500,14 +1556,11 @@ private:
         mix(appearance.displayId);
         mix(appearance.nativeDisplayId);
         mix(appearance.mountDisplayId);
-        for (uint32 item : appearance.items)
+        for (uint32 item : appearance.gear.items)
             mix(item);
-        mix(appearance.mainHandType | appearance.mainHandSubclass << 8 | appearance.offHandType << 16 |
-            appearance.rangedSubclass << 24);
+        mix(appearance.gear.mainHandType | appearance.gear.mainHandSubclass << 8 | appearance.gear.offHandType << 16 |
+            appearance.gear.rangedSubclass << 24);
 
-        uint64 const key = appearance.guid | (unit->IsPlayer() ? 0 : uint64(1) << 32);
-        auto [iterator, inserted] = state.appearances.try_emplace(key);
-        StreamSessionState::SentSignature& sent = iterator->second;
         if (!inserted && sent.signature == signature && nowMs - sent.sentAtMs < STREAM_APPEARANCE_REFRESH_MS)
             return;
         sent.signature = signature;
@@ -1832,8 +1885,22 @@ class wowmin_telemetry_playerscript : public PlayerScript
 public:
     wowmin_telemetry_playerscript()
         : PlayerScript("wowmin_telemetry_playerscript",
-                       {PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_STORE_NEW_ITEM})
+                       {PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_STORE_NEW_ITEM,
+                        PLAYERHOOK_ON_EQUIP, PLAYERHOOK_ON_UNEQUIP_ITEM})
     {
+    }
+
+    // Streams re-read a player's gear after either of these.
+    void OnPlayerEquip(Player* player, Item* /*item*/, uint8 /*bag*/, uint8 /*slot*/, bool /*update*/) override
+    {
+        if (player)
+            BumpGearRevision(player->GetGUID().GetCounter());
+    }
+
+    void OnPlayerUnequip(Player* player, Item* /*item*/) override
+    {
+        if (player)
+            BumpGearRevision(player->GetGUID().GetCounter());
     }
 
     void OnPlayerLevelChanged(Player* player, uint8 oldLevel) override
