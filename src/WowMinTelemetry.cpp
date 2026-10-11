@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -41,6 +42,10 @@
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "Spell.h"
+#include "SpellAuraEffects.h"
+#include "SpellAuras.h"
+#include "SpellInfo.h"
 #include "ScriptMgr.h"
 #include "StringConvert.h"
 #include "TypeContainerVisitor.h"
@@ -278,6 +283,27 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //     u8 rangedSubclass, so the right attack animation can be chosen. For a
 //     creature only the display IDs, the sheath state, the scale, and the
 //     weapon slots matter.
+//
+// Combat events (casts, notable auras, auto-attack swings, damage, and heals)
+// are gathered from the core's hooks as they happen and sent with the next
+// snapshot, at most STREAM_MAX_EVENTS per snapshot; the header's reserved u16
+// (offset 22) counts the events dropped beyond that. Only subscribed sessions
+// gather any.
+//   header (24 bytes): "WME1", then as for paths, with u16 eventCount
+//   event (44 bytes): u8 kind (1 cast started, 2 cast fired, 3 cast
+//     cancelled, 4 aura applied or refreshed, 5 aura removed, 6 auto-attack
+//     swing, 7 damage, 8 heal), u8 flags (1 the source is a creature, 2 the
+//     target is a creature, 4 area spell, 8 channelled, 16 has a ground
+//     point, 32 periodic, 64 helpful, 128 triggered by another spell),
+//     u8 schoolMask, u8 auraCategory (0 none, 1 crowd control, 2 shield or
+//     immunity, 3 defensive, 4 offensive), u32 sourceGuid (0: none),
+//     u32 targetGuid (0: none), u32 spellId (0: none, e.g. a white hit),
+//     u32 value (cast started: cast time in ms; cast fired: channel duration
+//     in ms; aura applied: duration in ms, 0 if permanent; damage and heal:
+//     the final amount), f32 missileSpeed (yards per second; 0: instant),
+//     f32 radius (yards; 0: none), f32 x, f32 y, f32 z (the ground point),
+//     u16 ageMs (how long before the header's server time it happened),
+//     u16 reserved
 
 constexpr uint8 STREAM_VERSION = 1;
 constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
@@ -301,6 +327,58 @@ constexpr uint64 STREAM_APPEARANCE_REFRESH_MS = 5000;
 // Gear is read when a unit is first seen and after a player equips or
 // unequips something; this re-read catches anything those hooks miss.
 constexpr uint64 STREAM_GEAR_REFRESH_MS = 60000;
+constexpr std::size_t STREAM_MAX_EVENTS = 256;
+
+enum StreamEventKind : uint8
+{
+    STREAM_EVENT_CAST_START = 1,
+    STREAM_EVENT_CAST_GO = 2,
+    STREAM_EVENT_CAST_CANCEL = 3,
+    STREAM_EVENT_AURA_APPLY = 4,
+    STREAM_EVENT_AURA_REMOVE = 5,
+    STREAM_EVENT_SWING = 6,
+    STREAM_EVENT_DAMAGE = 7,
+    STREAM_EVENT_HEAL = 8,
+};
+
+enum StreamEventFlag : uint8
+{
+    STREAM_EVENT_SOURCE_CREATURE = 1,
+    STREAM_EVENT_TARGET_CREATURE = 2,
+    STREAM_EVENT_AREA = 4,
+    STREAM_EVENT_CHANNELED = 8,
+    STREAM_EVENT_GROUND = 16,
+    STREAM_EVENT_PERIODIC = 32,
+    STREAM_EVENT_HELPFUL = 64,
+    STREAM_EVENT_TRIGGERED = 128,
+};
+
+enum StreamAuraCategory : uint8
+{
+    STREAM_AURA_NONE = 0,
+    STREAM_AURA_CROWD_CONTROL = 1,
+    STREAM_AURA_SHIELD = 2,
+    STREAM_AURA_DEFENSIVE = 3,
+    STREAM_AURA_OFFENSIVE = 4,
+};
+
+struct StreamCombatEvent
+{
+    uint8 kind = 0;
+    uint8 flags = 0;
+    uint8 schoolMask = 0;
+    uint8 auraCategory = STREAM_AURA_NONE;
+    uint32 sourceGuid = 0;
+    uint32 targetGuid = 0;
+    uint32 spellId = 0;
+    uint32 value = 0;
+    float missileSpeed = 0.0f;
+    float radius = 0.0f;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    uint64 atMs = 0;
+};
 
 // What a unit wears: item display IDs by equipment slot, and the weapon types
 // that choose its attack animation.
@@ -371,6 +449,11 @@ struct StreamSessionState
     };
     // Keyed by guid, with bit 32 set for creatures.
     std::unordered_map<uint64, SentAppearance> appearances;
+    // Filled by the combat hooks and emptied by each snapshot. The hooks
+    // normally run on the session's map thread, but take no chances.
+    std::mutex eventMutex;
+    std::vector<StreamCombatEvent> events;
+    uint32 droppedEvents = 0;
 };
 
 struct StreamSubscription
@@ -383,6 +466,9 @@ struct StreamSubscription
 
 std::mutex streamStateMutex;
 std::unordered_map<uint64, StreamSubscription> streamSubscriptions;
+// Lets the combat hooks, which run for every unit, skip the lock while nobody
+// is watching. Updated with streamSubscriptions, under streamStateMutex.
+std::atomic<bool> streamAnySubscribed = false;
 
 struct StreamPlayer
 {
@@ -714,6 +800,43 @@ std::vector<std::vector<uint8>> BuildAppearanceDatagrams(uint32 mapId, uint32 in
         AppendU8(entry, appearance.gear.rangedSubclass);
     }
     return PackEntries("WMA1", mapId, instanceId, serverTimeMs, entries);
+}
+
+std::vector<std::vector<uint8>> BuildCombatEventDatagrams(uint32 mapId, uint32 instanceId, uint64 serverTimeMs,
+                                                          std::vector<StreamCombatEvent> const& events,
+                                                          uint32 droppedEvents)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(events.size());
+    for (StreamCombatEvent const& event : events)
+    {
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(44);
+        AppendU8(entry, event.kind);
+        AppendU8(entry, event.flags);
+        AppendU8(entry, event.schoolMask);
+        AppendU8(entry, event.auraCategory);
+        AppendU32(entry, event.sourceGuid);
+        AppendU32(entry, event.targetGuid);
+        AppendU32(entry, event.spellId);
+        AppendU32(entry, event.value);
+        AppendF32(entry, event.missileSpeed);
+        AppendF32(entry, event.radius);
+        AppendF32(entry, event.x);
+        AppendF32(entry, event.y);
+        AppendF32(entry, event.z);
+        AppendU16(entry, uint16(std::min<uint64>(serverTimeMs - std::min(event.atMs, serverTimeMs), 65535)));
+        AppendU16(entry, 0);
+    }
+    std::vector<std::vector<uint8>> datagrams =
+        PackEntries("WME1", mapId, instanceId, uint32(serverTimeMs), entries);
+    if (!datagrams.empty())
+    {
+        uint16 const dropped = uint16(std::min<uint32>(droppedEvents, 65535));
+        datagrams.front()[22] = uint8(dropped);
+        datagrams.front()[23] = uint8(dropped >> 8);
+    }
+    return datagrams;
 }
 
 ItemTemplate const* GetItemTemplate(uint32 itemEntry)
@@ -1113,8 +1236,11 @@ public:
             if (iterator != streamSubscriptions.end())
                 iterator->second.expiresAtMs = expiresAtMs;
             else if (streamSubscriptions.size() < STREAM_MAX_SUBSCRIPTIONS)
+            {
                 streamSubscriptions.emplace(
                     sessionKey, StreamSubscription{expiresAtMs, 0, 0, std::make_shared<StreamSessionState>()});
+                streamAnySubscribed = true;
+            }
             else
             {
                 handler->SendSysMessage("WSTREAM|full");
@@ -1343,6 +1469,7 @@ public:
 
         std::lock_guard<std::mutex> streamLock(streamStateMutex);
         streamSubscriptions.erase(sessionKey);
+        streamAnySubscribed = !streamSubscriptions.empty();
     }
 
     void OnMapUpdate(Map* map, uint32 diff) override
@@ -1386,6 +1513,7 @@ private:
             if (iterator->second.expiresAtMs < nowMs)
             {
                 streamSubscriptions.erase(iterator);
+                streamAnySubscribed = !streamSubscriptions.empty();
                 return;
             }
             iterator->second.elapsedMs += diff;
@@ -1472,6 +1600,17 @@ private:
         if (!appearances.empty())
             streamSender.Send(BuildAppearanceDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), appearances),
                               host, port);
+        std::vector<StreamCombatEvent> events;
+        uint32 droppedEvents = 0;
+        {
+            std::lock_guard<std::mutex> lock(state->eventMutex);
+            events.swap(state->events);
+            std::swap(droppedEvents, state->droppedEvents);
+        }
+        if (!events.empty())
+            streamSender.Send(
+                BuildCombatEventDatagrams(map->GetId(), map->GetInstanceId(), nowMs, events, droppedEvents), host,
+                port);
     }
 
     // What the unit wears: the visible entry for players, so transmogrification
@@ -1846,6 +1985,353 @@ private:
     }
 };
 
+// ── Combat events ────────────────────────────────────────────
+
+// Queues a combat event for the stream of the session the unit is in, if
+// anyone is watching it.
+void RecordCombatEvent(Unit const* unit, StreamCombatEvent const& event)
+{
+    if (!streamAnySubscribed || !unit || !unit->IsInWorld())
+        return;
+    Map* map = unit->GetMap();
+    if (!map || !map->GetInstanceId())
+        return;
+    std::shared_ptr<StreamSessionState> state;
+    {
+        std::lock_guard<std::mutex> lock(streamStateMutex);
+        auto const iterator = streamSubscriptions.find(GetSessionKey(map->GetId(), map->GetInstanceId()));
+        if (iterator == streamSubscriptions.end())
+            return;
+        state = iterator->second.state;
+    }
+    std::lock_guard<std::mutex> lock(state->eventMutex);
+    if (state->events.size() >= STREAM_MAX_EVENTS)
+    {
+        ++state->droppedEvents;
+        return;
+    }
+    state->events.push_back(event);
+    state->events.back().atMs = GameTime::GetGameTimeMS().count();
+}
+
+void SetEventSource(StreamCombatEvent& event, ObjectGuid guid)
+{
+    event.sourceGuid = guid.GetCounter();
+    if (guid && !guid.IsPlayer())
+        event.flags |= STREAM_EVENT_SOURCE_CREATURE;
+}
+
+void SetEventTarget(StreamCombatEvent& event, ObjectGuid guid)
+{
+    event.targetGuid = guid.GetCounter();
+    if (guid && !guid.IsPlayer())
+        event.flags |= STREAM_EVENT_TARGET_CREATURE;
+}
+
+StreamCombatEvent MakeUnitEvent(uint8 kind, Unit const* source, Unit const* target)
+{
+    StreamCombatEvent event;
+    event.kind = kind;
+    if (source)
+        SetEventSource(event, source->GetGUID());
+    if (target)
+        SetEventTarget(event, target->GetGUID());
+    return event;
+}
+
+// Which notable kind of aura a spell applies, if any: crowd control, shields
+// and immunities, and big defensive and offensive cooldowns. Read from the
+// spell alone, so an aura is classed the same way when it goes as when it
+// came. Passive auras never count, and permanent ones only as crowd control.
+uint8 ClassifyAura(SpellInfo const* spellInfo)
+{
+    if (!spellInfo || spellInfo->IsPassive())
+        return STREAM_AURA_NONE;
+    bool const permanent = spellInfo->GetMaxDuration() < 0;
+    uint8 category = STREAM_AURA_NONE;
+    // Lower values win: crowd control, then shield, defensive, offensive.
+    auto consider = [&](uint8 candidate)
+    {
+        if (category == STREAM_AURA_NONE || candidate < category)
+            category = candidate;
+    };
+    for (SpellEffectInfo const& effect : spellInfo->GetEffects())
+    {
+        if (!effect.IsAura())
+            continue;
+        int32 const amount = effect.CalcValue();
+        switch (effect.ApplyAuraName)
+        {
+            case SPELL_AURA_MOD_STUN:
+            case SPELL_AURA_MOD_FEAR:
+            case SPELL_AURA_MOD_CONFUSE:
+            case SPELL_AURA_MOD_CHARM:
+            case SPELL_AURA_MOD_POSSESS:
+            case SPELL_AURA_MOD_ROOT:
+            case SPELL_AURA_MOD_SILENCE:
+            case SPELL_AURA_MOD_PACIFY:
+            case SPELL_AURA_MOD_PACIFY_SILENCE:
+                consider(STREAM_AURA_CROWD_CONTROL);
+                break;
+            case SPELL_AURA_SCHOOL_ABSORB:
+            case SPELL_AURA_SCHOOL_IMMUNITY:
+            case SPELL_AURA_DAMAGE_IMMUNITY:
+                if (!permanent)
+                    consider(STREAM_AURA_SHIELD);
+                break;
+            case SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN:
+                if (!permanent && amount <= -20)
+                    consider(STREAM_AURA_DEFENSIVE);
+                break;
+            case SPELL_AURA_MOD_DAMAGE_PERCENT_DONE:
+                if (!permanent && amount >= 10)
+                    consider(STREAM_AURA_OFFENSIVE);
+                break;
+            case SPELL_AURA_MOD_MELEE_HASTE:
+            case SPELL_AURA_MOD_MELEE_RANGED_HASTE:
+            case SPELL_AURA_MOD_CASTING_SPEED_NOT_STACK:
+            case SPELL_AURA_HASTE_SPELLS:
+                if (!permanent && amount >= 20)
+                    consider(STREAM_AURA_OFFENSIVE);
+                break;
+            default:
+                break;
+        }
+    }
+    return category;
+}
+
+// A spell's school, its missile speed, and the reach of its area effects.
+void SetEventSpell(StreamCombatEvent& event, SpellInfo const* spellInfo, WorldObject* caster)
+{
+    event.spellId = spellInfo->Id;
+    event.schoolMask = uint8(spellInfo->SchoolMask);
+    if (spellInfo->IsPositive())
+        event.flags |= STREAM_EVENT_HELPFUL;
+    if (spellInfo->IsAffectingArea())
+        event.flags |= STREAM_EVENT_AREA;
+    if (spellInfo->IsChanneled())
+        event.flags |= STREAM_EVENT_CHANNELED;
+    event.missileSpeed = spellInfo->Speed;
+    for (SpellEffectInfo const& effect : spellInfo->GetEffects())
+        if (effect.HasRadius())
+            event.radius = std::max(event.radius, effect.CalcRadius(caster));
+}
+
+StreamCombatEvent MakeCastEvent(uint8 kind, Spell* spell, Unit* caster, SpellInfo const* spellInfo)
+{
+    StreamCombatEvent event = MakeUnitEvent(kind, caster, spell->m_targets.GetUnitTarget());
+    SetEventSpell(event, spellInfo, caster);
+    if (spell->IsTriggered())
+        event.flags |= STREAM_EVENT_TRIGGERED;
+    if (spell->m_targets.HasDst())
+    {
+        if (WorldLocation const* point = spell->m_targets.GetDstPos())
+        {
+            event.flags |= STREAM_EVENT_GROUND;
+            event.x = point->GetPositionX();
+            event.y = point->GetPositionY();
+            event.z = point->GetPositionZ();
+        }
+    }
+    return event;
+}
+
+// The spell behind the damage or heal the core is about to deal. Its hooks
+// say which spell it is but not the final amount; the hooks that follow on
+// the same thread give the amount but not the spell, so they are paired here.
+struct PendingSpellAmount
+{
+    Unit const* source = nullptr;
+    Unit const* target = nullptr;
+    SpellInfo const* spellInfo = nullptr;
+    bool periodic = false;
+};
+
+thread_local PendingSpellAmount pendingDamage;
+thread_local PendingSpellAmount pendingHeal;
+
+// Auto-attack swings are seen once per damage school; one is enough.
+struct LastSwing
+{
+    Unit const* attacker = nullptr;
+    Unit const* target = nullptr;
+    uint64 atMs = 0;
+};
+
+thread_local LastSwing lastSwing;
+
+class wowmin_telemetry_spellscript : public AllSpellScript
+{
+public:
+    wowmin_telemetry_spellscript()
+        : AllSpellScript("wowmin_telemetry_spellscript",
+                         {ALLSPELLHOOK_ON_PREPARE, ALLSPELLHOOK_ON_CAST, ALLSPELLHOOK_ON_CAST_CANCEL})
+    {
+    }
+
+    // Instant spells have already fired by the time this runs.
+    void OnSpellPrepare(Spell* spell, Unit* caster, SpellInfo const* spellInfo) override
+    {
+        if (!streamAnySubscribed || !spell || !caster || !spellInfo || spellInfo->IsPassive() ||
+            spellInfo->IsChanneled() || spell->GetCastTime() <= 0)
+            return;
+        StreamCombatEvent event = MakeCastEvent(STREAM_EVENT_CAST_START, spell, caster, spellInfo);
+        event.value = uint32(spell->GetCastTime());
+        RecordCombatEvent(caster, event);
+    }
+
+    void OnSpellCast(Spell* spell, Unit* caster, SpellInfo const* spellInfo, bool /*skipCheck*/) override
+    {
+        if (!streamAnySubscribed || !spell || !caster || !spellInfo || spellInfo->IsPassive())
+            return;
+        StreamCombatEvent event = MakeCastEvent(STREAM_EVENT_CAST_GO, spell, caster, spellInfo);
+        if (spellInfo->IsChanneled())
+            event.value = uint32(std::max(0, spellInfo->GetMaxDuration()));
+        RecordCombatEvent(caster, event);
+    }
+
+    void OnSpellCastCancel(Spell* spell, Unit* caster, SpellInfo const* spellInfo, bool /*bySelf*/) override
+    {
+        if (!streamAnySubscribed || !spell || !caster || !spellInfo ||
+            (spell->GetCastTime() <= 0 && !spellInfo->IsChanneled()))
+            return;
+        RecordCombatEvent(caster, MakeCastEvent(STREAM_EVENT_CAST_CANCEL, spell, caster, spellInfo));
+    }
+};
+
+class wowmin_telemetry_combatscript : public UnitScript
+{
+public:
+    // DealDamage has no hook flag: it runs for every unit script.
+    wowmin_telemetry_combatscript()
+        : UnitScript("wowmin_telemetry_combatscript", true,
+                     {UNITHOOK_MODIFY_MELEE_DAMAGE, UNITHOOK_MODIFY_SPELL_DAMAGE_TAKEN,
+                      UNITHOOK_MODIFY_PERIODIC_DAMAGE_AURAS_TICK, UNITHOOK_MODIFY_HEAL_RECEIVED, UNITHOOK_ON_HEAL,
+                      UNITHOOK_ON_AURA_APPLY, UNITHOOK_ON_AURA_REMOVE})
+    {
+    }
+
+    // Runs for every auto-attack swing, before the hit is rolled, so misses
+    // count too.
+    void ModifyMeleeDamage(Unit* target, Unit* attacker, uint32& /*damage*/) override
+    {
+        if (!streamAnySubscribed || !target || !attacker)
+            return;
+        uint64 const nowMs = GameTime::GetGameTimeMS().count();
+        if (lastSwing.attacker == attacker && lastSwing.target == target && lastSwing.atMs == nowMs)
+            return;
+        lastSwing = {attacker, target, nowMs};
+        StreamCombatEvent event = MakeUnitEvent(STREAM_EVENT_SWING, attacker, target);
+        event.schoolMask = SPELL_SCHOOL_MASK_NORMAL;
+        RecordCombatEvent(attacker, event);
+    }
+
+    void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& /*damage*/, SpellInfo const* spellInfo) override
+    {
+        if (streamAnySubscribed)
+            pendingDamage = {attacker, target, spellInfo, false};
+    }
+
+    void ModifyPeriodicDamageAurasTick(Unit* target, Unit* attacker, uint32& /*damage*/,
+                                       SpellInfo const* spellInfo) override
+    {
+        if (streamAnySubscribed)
+            pendingDamage = {attacker, target, spellInfo, true};
+    }
+
+    // The final amount, after armour, resistances, and absorbs.
+    uint32 DealDamage(Unit* attacker, Unit* victim, uint32 damage, DamageEffectType damageType) override
+    {
+        if (!streamAnySubscribed || !victim || !damage ||
+            (damageType != DIRECT_DAMAGE && damageType != SPELL_DIRECT_DAMAGE && damageType != DOT))
+            return damage;
+        StreamCombatEvent event = MakeUnitEvent(STREAM_EVENT_DAMAGE, attacker, victim);
+        event.value = damage;
+        if (damageType == DOT)
+            event.flags |= STREAM_EVENT_PERIODIC;
+        if (damageType == DIRECT_DAMAGE)
+            event.schoolMask = SPELL_SCHOOL_MASK_NORMAL;
+        else if (pendingDamage.spellInfo && pendingDamage.source == attacker && pendingDamage.target == victim)
+        {
+            event.spellId = pendingDamage.spellInfo->Id;
+            event.schoolMask = uint8(pendingDamage.spellInfo->SchoolMask);
+            if (pendingDamage.periodic)
+                event.flags |= STREAM_EVENT_PERIODIC;
+        }
+        pendingDamage = {};
+        RecordCombatEvent(victim, event);
+        return damage;
+    }
+
+    // The core passes healer and target in either order here, depending on
+    // the path, so OnHeal matches them either way round.
+    void ModifyHealReceived(Unit* target, Unit* healer, uint32& /*heal*/, SpellInfo const* spellInfo) override
+    {
+        if (!streamAnySubscribed)
+            return;
+        bool const periodic = pendingDamage.periodic && pendingDamage.spellInfo == spellInfo;
+        pendingHeal = {healer, target, spellInfo, periodic};
+        pendingDamage = {};
+    }
+
+    // The amount actually healed, without overhealing.
+    void OnHeal(Unit* healer, Unit* receiver, uint32& gain) override
+    {
+        if (!streamAnySubscribed || !receiver || !gain)
+            return;
+        StreamCombatEvent event = MakeUnitEvent(STREAM_EVENT_HEAL, healer, receiver);
+        event.value = gain;
+        event.flags |= STREAM_EVENT_HELPFUL;
+        bool const matches = (pendingHeal.source == healer && pendingHeal.target == receiver) ||
+                             (pendingHeal.source == receiver && pendingHeal.target == healer);
+        if (pendingHeal.spellInfo && matches)
+        {
+            event.spellId = pendingHeal.spellInfo->Id;
+            event.schoolMask = uint8(pendingHeal.spellInfo->SchoolMask);
+            if (pendingHeal.periodic)
+                event.flags |= STREAM_EVENT_PERIODIC;
+        }
+        pendingHeal = {};
+        RecordCombatEvent(receiver, event);
+    }
+
+    void OnAuraApply(Unit* unit, Aura* aura) override
+    {
+        if (!streamAnySubscribed || !unit || !aura)
+            return;
+        RecordAura(STREAM_EVENT_AURA_APPLY, unit, aura);
+    }
+
+    void OnAuraRemove(Unit* unit, AuraApplication* application, AuraRemoveMode /*mode*/) override
+    {
+        if (!streamAnySubscribed || !unit || !application || !application->GetBase())
+            return;
+        RecordAura(STREAM_EVENT_AURA_REMOVE, unit, application->GetBase());
+    }
+
+private:
+    static void RecordAura(uint8 kind, Unit* unit, Aura const* aura)
+    {
+        SpellInfo const* spellInfo = aura->GetSpellInfo();
+        uint8 const category = ClassifyAura(spellInfo);
+        if (category == STREAM_AURA_NONE)
+            return;
+        StreamCombatEvent event;
+        event.kind = kind;
+        SetEventSource(event, aura->GetCasterGUID());
+        SetEventTarget(event, unit->GetGUID());
+        event.spellId = spellInfo->Id;
+        event.schoolMask = uint8(spellInfo->SchoolMask);
+        event.auraCategory = category;
+        if (spellInfo->IsPositive())
+            event.flags |= STREAM_EVENT_HELPFUL;
+        if (kind == STREAM_EVENT_AURA_APPLY)
+            event.value = uint32(std::max(0, aura->GetDuration()));
+        RecordCombatEvent(unit, event);
+    }
+};
+
 class wowmin_telemetry_unitscript : public UnitScript
 {
 public:
@@ -1970,6 +2456,8 @@ void AddSC_wowmin_telemetry()
     new wowmin_telemetry_commandscript();
     new wowmin_telemetry_mapscript();
     new wowmin_telemetry_unitscript();
+    new wowmin_telemetry_combatscript();
+    new wowmin_telemetry_spellscript();
     new wowmin_telemetry_playerscript();
     new wowmin_telemetry_worldscript();
 }
