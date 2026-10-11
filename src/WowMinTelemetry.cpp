@@ -3,6 +3,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -261,6 +262,22 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //     u8 actionCount, u8 reserved, the strategies of its current state
 //     (comma-separated), then actionCount x (u8 nameLength, u8 reserved,
 //     u16 repeats, f32 relevance, u32 ageMs, name bytes), newest first
+//
+// How each player and creature looks goes in its own datagrams too, whenever
+// it changes and every STREAM_APPEARANCE_REFRESH_MS otherwise, so wowmin can
+// draw their models with their gear.
+//   header (24 bytes): "WMA1", then as for paths, with u16 unitCount
+//   unit (108 bytes): u32 guid, u8 flags (1 a creature, not a player, 2 helm
+//     hidden, 4 cloak hidden), u8 race, u8 gender, u8 class, u8 skin, u8 face,
+//     u8 hairStyle, u8 hairColor, u8 facialStyle, u8 sheathState (0 none,
+//     1 melee drawn, 2 ranged drawn), u16 scale (object scale x 1000),
+//     u32 displayId,
+//     u32 nativeDisplayId, u32 mountDisplayId, then 19 x u32 item display IDs
+//     by equipment slot (0: empty), then u8 mainHandType (InventoryType),
+//     u8 mainHandSubclass (weapon subclass), u8 offHandType (InventoryType),
+//     u8 rangedSubclass, so the right attack animation can be chosen. For a
+//     creature only the display IDs, the sheath state, the scale, and the
+//     weapon slots matter.
 
 constexpr uint8 STREAM_VERSION = 1;
 constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
@@ -280,6 +297,7 @@ constexpr std::size_t STREAM_MAX_STRATEGIES = 400;
 constexpr std::size_t STREAM_MAX_ACTION_NAME = 48;
 // Actions kept per bot; a run of the same action counts as one.
 constexpr std::size_t BOT_ACTION_HISTORY = 6;
+constexpr uint64 STREAM_APPEARANCE_REFRESH_MS = 5000;
 
 // What was last sent for each path and creature, keyed by guid. Only the
 // session's map thread uses it.
@@ -303,13 +321,15 @@ struct StreamSessionState
     };
     std::unordered_map<uint32, SentPath> playerPaths;
     std::unordered_map<uint32, SentPath> creaturePaths;
-    struct SentBot
+    struct SentSignature
     {
         uint64 sentAtMs = 0;
         std::size_t signature = 0;
     };
     std::unordered_map<uint32, SentCreature> creatures;
-    std::unordered_map<uint32, SentBot> bots;
+    std::unordered_map<uint32, SentSignature> bots;
+    // Keyed by guid, with bit 32 set for creatures.
+    std::unordered_map<uint64, SentSignature> appearances;
 };
 
 struct StreamSubscription
@@ -359,6 +379,30 @@ struct StreamCreature
     uint8 flags;
     uint32 targetGuid;
     int32 wmoGroupId;
+};
+
+struct StreamAppearance
+{
+    uint32 guid = 0;
+    uint8 flags = 0;
+    uint8 race = 0;
+    uint8 gender = 0;
+    uint8 unitClass = 0;
+    uint8 skin = 0;
+    uint8 face = 0;
+    uint8 hairStyle = 0;
+    uint8 hairColor = 0;
+    uint8 facialStyle = 0;
+    uint8 sheathState = 0;
+    uint16 scale = 1000;
+    uint32 displayId = 0;
+    uint32 nativeDisplayId = 0;
+    uint32 mountDisplayId = 0;
+    std::array<uint32, EQUIPMENT_SLOT_END> items{};
+    uint8 mainHandType = 0;
+    uint8 mainHandSubclass = 0;
+    uint8 offHandType = 0;
+    uint8 rangedSubclass = 0;
 };
 
 struct StreamBotAction
@@ -599,6 +643,45 @@ std::vector<std::vector<uint8>> BuildBotDatagrams(uint32 mapId, uint32 instanceI
         }
     }
     return PackEntries("WMB1", mapId, instanceId, serverTimeMs, entries);
+}
+
+std::vector<std::vector<uint8>> BuildAppearanceDatagrams(uint32 mapId, uint32 instanceId, uint32 serverTimeMs,
+                                                         std::vector<StreamAppearance> const& appearances)
+{
+    std::vector<std::vector<uint8>> entries;
+    entries.reserve(appearances.size());
+    for (StreamAppearance const& appearance : appearances)
+    {
+        std::vector<uint8>& entry = entries.emplace_back();
+        entry.reserve(32 + appearance.items.size() * 4);
+        AppendU32(entry, appearance.guid);
+        AppendU8(entry, appearance.flags);
+        AppendU8(entry, appearance.race);
+        AppendU8(entry, appearance.gender);
+        AppendU8(entry, appearance.unitClass);
+        AppendU8(entry, appearance.skin);
+        AppendU8(entry, appearance.face);
+        AppendU8(entry, appearance.hairStyle);
+        AppendU8(entry, appearance.hairColor);
+        AppendU8(entry, appearance.facialStyle);
+        AppendU8(entry, appearance.sheathState);
+        AppendU16(entry, appearance.scale);
+        AppendU32(entry, appearance.displayId);
+        AppendU32(entry, appearance.nativeDisplayId);
+        AppendU32(entry, appearance.mountDisplayId);
+        for (uint32 item : appearance.items)
+            AppendU32(entry, item);
+        AppendU8(entry, appearance.mainHandType);
+        AppendU8(entry, appearance.mainHandSubclass);
+        AppendU8(entry, appearance.offHandType);
+        AppendU8(entry, appearance.rangedSubclass);
+    }
+    return PackEntries("WMA1", mapId, instanceId, serverTimeMs, entries);
+}
+
+ItemTemplate const* GetItemTemplate(uint32 itemEntry)
+{
+    return itemEntry ? sObjectMgr->GetItemTemplate(itemEntry) : nullptr;
 }
 
 #ifdef MOD_PLAYERBOTS
@@ -1280,6 +1363,7 @@ private:
         std::vector<StreamPlayer> players;
         std::vector<StreamPath> paths;
         std::vector<StreamBot> bots;
+        std::vector<StreamAppearance> appearances;
         for (auto const& playerReference : map->GetPlayers())
         {
             Player* player = playerReference.GetSource();
@@ -1306,6 +1390,7 @@ private:
                                GetUnitWmoGroupId(map, player),
                                player->GetName()});
             CollectPathChange(player, player->GetGUID().GetCounter(), false, state->playerPaths, nowMs, paths);
+            CollectAppearance(player, *state, nowMs, appearances);
 #ifdef MOD_PLAYERBOTS
             if (player->GetSession() && player->GetSession()->IsHeadless())
                 CollectBot(map, player, *state, nowMs, bots);
@@ -1325,7 +1410,16 @@ private:
                                               [&](StreamPlayer const& player) { return player.guid == entry.first; });
                       });
         std::vector<StreamCreature> creatures;
-        CollectCreatures(map, *state, nowMs, creatures, paths);
+        CollectCreatures(map, *state, nowMs, creatures, paths, appearances);
+        // Forget units that have gone, so a return is sent as new.
+        std::erase_if(state->appearances,
+                      [&](auto const& entry)
+                      {
+                          if (entry.first >> 32)
+                              return !state->creatures.contains(uint32(entry.first));
+                          return std::none_of(players.begin(), players.end(), [&](StreamPlayer const& player)
+                                              { return player.guid == uint32(entry.first); });
+                      });
 
         std::string_view const host = telemetryConfig.GetConfigValue(WowMinTelemetryConfig::StreamHost);
         uint32 const port = telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::StreamPort);
@@ -1338,6 +1432,87 @@ private:
             streamSender.Send(BuildPathDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), paths), host, port);
         if (!bots.empty())
             streamSender.Send(BuildBotDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), bots), host, port);
+        if (!appearances.empty())
+            streamSender.Send(BuildAppearanceDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), appearances),
+                              host, port);
+    }
+
+    // Adds how the unit looks to `appearances` when that has changed, or is
+    // due a refresh.
+    static void CollectAppearance(Unit* unit, StreamSessionState& state, uint64 nowMs,
+                                  std::vector<StreamAppearance>& appearances)
+    {
+        StreamAppearance appearance;
+        appearance.guid = unit->GetGUID().GetCounter();
+        appearance.displayId = unit->GetDisplayId();
+        appearance.nativeDisplayId = unit->GetNativeDisplayId();
+        appearance.mountDisplayId = unit->GetMountID();
+        appearance.sheathState = uint8(unit->GetSheath());
+        appearance.scale = uint16(std::clamp(unit->GetObjectScale() * 1000.0f, 0.0f, 65535.0f));
+        appearance.race = unit->getRace();
+        appearance.gender = unit->getGender();
+        appearance.unitClass = unit->getClass();
+        if (Player* player = unit->ToPlayer())
+        {
+            appearance.skin = player->GetByteValue(PLAYER_BYTES, PLAYER_BYTES_OFFSET_SKIN_ID);
+            appearance.face = player->GetByteValue(PLAYER_BYTES, PLAYER_BYTES_OFFSET_FACE_ID);
+            appearance.hairStyle = player->GetByteValue(PLAYER_BYTES, PLAYER_BYTES_OFFSET_HAIR_STYLE_ID);
+            appearance.hairColor = player->GetByteValue(PLAYER_BYTES, PLAYER_BYTES_OFFSET_HAIR_COLOR_ID);
+            appearance.facialStyle = player->GetByteValue(PLAYER_BYTES_2, PLAYER_BYTES_2_OFFSET_FACIAL_STYLE);
+            if (player->HasPlayerFlag(PLAYER_FLAGS_HIDE_HELM))
+                appearance.flags |= 2;
+            if (player->HasPlayerFlag(PLAYER_FLAGS_HIDE_CLOAK))
+                appearance.flags |= 4;
+        }
+        else
+            appearance.flags |= 1;
+        for (uint8 slot = 0; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            // The visible entry, so transmogrification shows; creatures only
+            // have weapon slots.
+            uint32 itemEntry = 0;
+            if (unit->IsPlayer())
+                itemEntry = unit->GetUInt32Value(PLAYER_VISIBLE_ITEM_1_ENTRYID + slot * 2);
+            else if (slot >= EQUIPMENT_SLOT_MAINHAND && slot <= EQUIPMENT_SLOT_RANGED)
+                itemEntry = unit->GetUInt32Value(UNIT_VIRTUAL_ITEM_SLOT_ID + slot - EQUIPMENT_SLOT_MAINHAND);
+            ItemTemplate const* itemTemplate = GetItemTemplate(itemEntry);
+            if (!itemTemplate)
+                continue;
+            appearance.items[slot] = itemTemplate->DisplayInfoID;
+            if (slot == EQUIPMENT_SLOT_MAINHAND)
+            {
+                appearance.mainHandType = uint8(itemTemplate->InventoryType);
+                appearance.mainHandSubclass = uint8(itemTemplate->SubClass);
+            }
+            else if (slot == EQUIPMENT_SLOT_OFFHAND)
+                appearance.offHandType = uint8(itemTemplate->InventoryType);
+            else if (slot == EQUIPMENT_SLOT_RANGED)
+                appearance.rangedSubclass = uint8(itemTemplate->SubClass);
+        }
+
+        std::size_t signature = 0;
+        auto mix = [&](uint64 value)
+        { signature ^= std::hash<uint64>{}(value) + 0x9e3779b97f4a7c15ULL + (signature << 6) + (signature >> 2); };
+        mix(appearance.flags);
+        mix(appearance.race | appearance.gender << 8 | appearance.unitClass << 16 | appearance.sheathState << 24);
+        mix(appearance.skin | appearance.face << 8 | appearance.hairStyle << 16 | appearance.hairColor << 24);
+        mix(appearance.facialStyle | appearance.scale << 8);
+        mix(appearance.displayId);
+        mix(appearance.nativeDisplayId);
+        mix(appearance.mountDisplayId);
+        for (uint32 item : appearance.items)
+            mix(item);
+        mix(appearance.mainHandType | appearance.mainHandSubclass << 8 | appearance.offHandType << 16 |
+            appearance.rangedSubclass << 24);
+
+        uint64 const key = appearance.guid | (unit->IsPlayer() ? 0 : uint64(1) << 32);
+        auto [iterator, inserted] = state.appearances.try_emplace(key);
+        StreamSessionState::SentSignature& sent = iterator->second;
+        if (!inserted && sent.signature == signature && nowMs - sent.sentAtMs < STREAM_APPEARANCE_REFRESH_MS)
+            return;
+        sent.signature = signature;
+        sent.sentAtMs = nowMs;
+        appearances.push_back(appearance);
     }
 
 #ifdef MOD_PLAYERBOTS
@@ -1353,7 +1528,7 @@ private:
         uint32 const guid = player->GetGUID().GetCounter();
         std::shared_ptr<BotActionLog> const log = TrackBotActions(guid, botAI->GetCurrentEngine());
         auto [iterator, inserted] = state.bots.try_emplace(guid);
-        StreamSessionState::SentBot& sent = iterator->second;
+        StreamSessionState::SentSignature& sent = iterator->second;
         if (!inserted && nowMs - sent.sentAtMs < STREAM_BOT_MIN_INTERVAL_MS)
             return;
 
@@ -1450,7 +1625,8 @@ private:
     // Adds each creature that moved, changed, or is due a refresh to
     // `creatures`, and its path to `paths` when that changed.
     static void CollectCreatures(Map* map, StreamSessionState& state, uint64 nowMs,
-                                 std::vector<StreamCreature>& creatures, std::vector<StreamPath>& paths)
+                                 std::vector<StreamCreature>& creatures, std::vector<StreamPath>& paths,
+                                 std::vector<StreamAppearance>& appearances)
     {
         std::vector<Creature*> present;
         StreamCreatureCollector collector(present);
@@ -1509,6 +1685,7 @@ private:
                                      sent.wmoGroupId});
             }
             CollectPathChange(creature, guid, true, state.creaturePaths, nowMs, paths);
+            CollectAppearance(creature, state, nowMs, appearances);
         }
         // Forget despawned creatures, so a respawn is sent as new.
         std::erase_if(state.creatures, [&](auto const& entry) { return !seen.contains(entry.first); });
