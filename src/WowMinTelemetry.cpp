@@ -303,7 +303,9 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //     the final amount), f32 missileSpeed (yards per second; 0: instant),
 //     f32 radius (yards; 0: none), f32 x, f32 y, f32 z (the ground point),
 //     u16 ageMs (how long before the header's server time it happened),
-//     u16 reserved
+//     u16 extraFlags (1 the spell leaves a lasting area on the ground, such as
+//     Consecration; its cast-fired event then carries the area's duration in
+//     value, as a channel's does)
 
 constexpr uint8 STREAM_VERSION = 1;
 constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
@@ -353,6 +355,11 @@ enum StreamEventFlag : uint8
     STREAM_EVENT_TRIGGERED = 128,
 };
 
+enum StreamEventExtraFlag : uint16
+{
+    STREAM_EVENT_PERSISTENT_AREA = 1,
+};
+
 enum StreamAuraCategory : uint8
 {
     STREAM_AURA_NONE = 0,
@@ -377,6 +384,7 @@ struct StreamCombatEvent
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
+    uint16 extraFlags = 0;
     uint64 atMs = 0;
 };
 
@@ -826,7 +834,7 @@ std::vector<std::vector<uint8>> BuildCombatEventDatagrams(uint32 mapId, uint32 i
         AppendF32(entry, event.y);
         AppendF32(entry, event.z);
         AppendU16(entry, uint16(std::min<uint64>(serverTimeMs - std::min(event.atMs, serverTimeMs), 65535)));
-        AppendU16(entry, 0);
+        AppendU16(entry, event.extraFlags);
     }
     std::vector<std::vector<uint8>> datagrams =
         PackEntries("WME1", mapId, instanceId, uint32(serverTimeMs), entries);
@@ -2186,7 +2194,9 @@ public:
         if (!streamAnySubscribed || !spell || !caster || !spellInfo || spellInfo->IsPassive())
             return;
         StreamCombatEvent event = MakeCastEvent(STREAM_EVENT_CAST_GO, spell, caster, spellInfo);
-        if (spellInfo->IsChanneled())
+        if (spellInfo->HasEffect(SPELL_EFFECT_PERSISTENT_AREA_AURA))
+            event.extraFlags |= STREAM_EVENT_PERSISTENT_AREA;
+        if (spellInfo->IsChanneled() || (event.extraFlags & STREAM_EVENT_PERSISTENT_AREA))
             event.value = uint32(std::max(0, spellInfo->GetMaxDuration()));
         RecordCombatEvent(caster, event);
     }
