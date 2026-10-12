@@ -52,6 +52,44 @@ integration reports the read-only server-selected team strategy and per-bot `bg 
 values are `-1`. WoWMin never changes either value. Version 2 fields retain their original meanings,
 including the core LFG role mask in `roleMask`.
 
+## Live stream (optional)
+
+For WoWMin's 3D Instance Watch the module can also stream one runtime instance
+over UDP, ten times a second by default. It is off unless
+`WowMinTelemetry.Stream.Enable = 1`.
+
+```text
+wowmin stream <mapId> <instanceId>
+```
+
+The command (also `SEC_ADMINISTRATOR`, console/SOAP) subscribes the instance for 10 seconds and
+replies `WSTREAM|<version>|<port>|<intervalMs>|<ttlMs>`, `WSTREAM|disabled`, or `WSTREAM|full`
+(at most 64 instances at once). WoWMin renews every few seconds while a page watches; the stream
+stops by itself when renewals stop. Datagrams go only to `WowMinTelemetry.Stream.Host` and
+`.Port`; the command cannot redirect them. They are not encrypted, so keep the destination on
+localhost or a trusted network.
+
+Every datagram starts with a four-byte magic and a version byte (1). The layouts, little-endian,
+are documented beside the code in `src/WowMinTelemetry.cpp`:
+
+| Magic | Carries | Sent |
+|---|---|---|
+| `WMS1` | Players: position, facing, health, power, state, WMO group, name | Every interval, split into parts when large |
+| `WMP1` | Movement paths (waypoints still ahead) of players, bots, and mobs | When a path changes, and every second |
+| `WMC1` | Creatures: entry, position, health, hostility, boss, target | When they move or change, and every second |
+| `WMB1` | Playerbot decisions: state, move target, strategies, recent actions (with `mod-playerbots`) | When they change, at most 4 a second, and every second |
+| `WMA1` | Appearance: race, look, display IDs, mount, sheath state, 19 item displays | On first sight and changes, and every 5 seconds |
+| `WME1` | Combat events: casts, notable auras, swings, damage, heals | With the next snapshot after they happen |
+| `WMU1` | Auras with spell art on each unit | When a unit's list changes, and every 5 seconds |
+| `WMV1` | Vehicle passengers and their seats | With every snapshot while any ride |
+| `WMG1` | Game objects with a model: banners, flags, doors, chests | When one appears or changes, and every 10 seconds |
+| `WMD1` | Harmful auras on each unit, for nameplates | When a unit's list changes, and every 3 seconds |
+| `WMR1` | Raid markers set by the instance's groups | When they change, and every 2 seconds |
+
+Only subscribed instances gather any of this: an unsubscribed instance costs one subscription lookup per
+map update, and the combat and aura hooks return at once while nothing is subscribed. Continents
+(instance ID 0) are not streamed.
+
 ## Concurrency
 
 The command acquires the core player-map shared lock only while copying immutable player rows. It
@@ -67,8 +105,10 @@ thread.
 3. Copy `mod-wowmin-telemetry.conf.dist` to the worldserver configuration directory as
    `mod-wowmin-telemetry.conf`.
 4. Set `WowMinTelemetry.Enable = 1`.
-5. Restart the worldserver.
-6. Test from an administrator console or SOAP client with `wowmin telemetry`.
+5. For WoWMin's 3D Instance Watch, also set `WowMinTelemetry.Stream.Enable = 1` and point
+   `WowMinTelemetry.Stream.Host`/`.Port` at the machine WoWMin runs on (its `WOWMIN_STREAM_PORT`).
+6. Restart the worldserver.
+7. Test from an administrator console or SOAP client with `wowmin telemetry`.
 
 The module is disabled by default. No database changes are required.
 
@@ -78,7 +118,8 @@ WoWMin should request `wowmin telemetry`, validate the `WMAP_VERSION` line, and 
 `WMAP_END` player, battleground, world-state, instance, boss, death, and event counts match parsed
 rows. Database coordinates remain a fallback when the command is disabled or unavailable. WoWMin
 retains parsers for legacy responses and protocol versions 1–6 so the service and module can be deployed in
-either order.
+either order. With a module that has no `wowmin stream` command, or the stream disabled, WoWMin's
+Instance Watch carries on with the 1 second telemetry.
 
 ## License
 
