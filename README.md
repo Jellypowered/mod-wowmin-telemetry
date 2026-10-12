@@ -53,6 +53,22 @@ integration reports the read-only server-selected team strategy and per-bot `bg 
 values are `-1`. WoWMin never changes either value. Version 2 fields retain their original meanings,
 including the core LFG role mask in `roleMask`.
 
+### Building with `mod-playerbots`
+
+When `mod-playerbots` is present (`MOD_PLAYERBOTS` is defined), the module compiles against parts of
+its internal API, not a stable interface, so a change to any of these breaks the build:
+
+- `PlayerbotAI` through `sPlayerbotsMgr->GetPlayerbotAI`: `GetState`, `GetStrategies`,
+  `GetAiObjectContext`, `GetCurrentEngine`
+- `Engine::AddActionExecutionListener` and the `ActionExecutionListener` interface (`Action.h`,
+  `Engine.h`)
+- the `"last movement"` value (`LastMovement`: `priority`, `msTime`, `lastMoveToMapId`,
+  `lastMoveToX`, `lastMoveToY`, `lastMoveToZ`) and the `"bg role"` value (`AiObjectContext.h`,
+  `LastMovementValue.h`)
+- `BGTactics::GetBotStrategyForTeam` (`BattleGroundTactics.h`)
+
+Checked against `mod-playerbots` as of October 2026.
+
 ## Live stream (optional)
 
 For WoWMin's 3D Instance Watch the module can also stream one runtime instance
