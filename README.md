@@ -36,7 +36,8 @@ battleground snapshots are captured by the battleground-end hook and remain quer
 Version 7 adds authoritative battleground flag-carrier state (`32`) while a player holds the Warsong,
 Silverwing, or Netherstorm flag aura. The bit clears with the aura when the flag is dropped, captured,
 returned, or lost on death. Version 6 adds gender plus a compact player-state bitmask: taxi flight (`1`),
-mounted (`2`), sapped (`4`), stunned (`8`), and Spirit of Redemption form (`16`). The existing `alive`, `inCombat`, and
+mounted (`2`), sapped (`4`), stunned (`8`), and Spirit of Redemption form (`16`); flying in the air (`64`) was
+added later within version 7, so readers should ignore bits they don't know. The existing `alive`, `inCombat`, and
 `waitingForResurrect` fields remain authoritative for death, combat, and resurrection indicators.
 Version 5 adds bounded, server-owned event IDs for participant kills, looted items, and level-ups.
 Kill credit follows the player owner of pets and controlled units; loot events include item ID, name,
