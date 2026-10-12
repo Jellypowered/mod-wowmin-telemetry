@@ -31,6 +31,8 @@ WEVENT|mapId|instanceId|eventId|occurredAt|type|actorGuid|actorName|targetGuid|t
 WMAP_END|playerCount|battlegroundCount|worldStateCount|instanceCount|bossCount|deathCount|eventCount
 ```
 
+`WBG.winner` uses the core `PvPTeamId`: Horde (`0`), Alliance (`1`), or neutral/draw (`2`). Final
+battleground snapshots are captured by the battleground-end hook and remain queryable until map destruction.
 Version 7 adds authoritative battleground flag-carrier state (`32`) while a player holds the Warsong,
 Silverwing, or Netherstorm flag aura. The bit clears with the aura when the flag is dropped, captured,
 returned, or lost on death. Version 6 adds gender plus a compact player-state bitmask: taxi flight (`1`),

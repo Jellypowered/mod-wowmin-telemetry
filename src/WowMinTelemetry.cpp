@@ -1612,6 +1612,10 @@ public:
         std::vector<TelemetryBattleground> battlegrounds;
         {
             std::lock_guard<std::mutex> lock(telemetryStateMutex);
+            for (auto const& [sessionKey, battleground] : battlegroundStates)
+                if ((!filterMap || battleground.mapId == *mapId) &&
+                    (!filterInstance || battleground.instanceId == *instanceId))
+                    activeSessionKeys.insert(sessionKey);
             for (uint64 sessionKey : activeSessionKeys)
                 if (auto const iterator = battlegroundStates.find(sessionKey); iterator != battlegroundStates.end())
                     battlegrounds.push_back(iterator->second);
@@ -1622,6 +1626,9 @@ public:
         std::vector<TelemetryEvent> events;
         {
             std::lock_guard<std::mutex> lock(telemetryStateMutex);
+            for (auto const& [sessionKey, instance] : instanceStates)
+                if ((!filterMap || instance.mapId == *mapId) && (!filterInstance || instance.instanceId == *instanceId))
+                    activeSessionKeys.insert(sessionKey);
             for (uint64 sessionKey : activeSessionKeys)
             {
                 if (auto const iterator = instanceStates.find(sessionKey); iterator != instanceStates.end())
@@ -2377,6 +2384,8 @@ private:
         std::erase_if(state.creaturePaths, [&](auto const& entry) { return !seen.contains(entry.first); });
     }
 
+public:
+    // Also called when a battleground ends (wowmin_telemetry_battlegroundscript).
     static void CaptureBattleground(BattlegroundMap* map, uint64 sessionKey)
     {
         Battleground* battleground = map->GetBG();
@@ -2446,6 +2455,7 @@ private:
 #endif
     }
 
+private:
     static void CaptureInstance(Map* map, uint64 sessionKey)
     {
         InstanceMap* instanceMap = map->ToInstanceMap();
@@ -2827,6 +2837,24 @@ private:
     }
 };
 
+class wowmin_telemetry_battlegroundscript : public AllBattlegroundScript
+{
+public:
+    wowmin_telemetry_battlegroundscript()
+        : AllBattlegroundScript("wowmin_telemetry_battlegroundscript", {ALLBATTLEGROUNDHOOK_ON_BATTLEGROUND_END})
+    {
+    }
+
+    void OnBattlegroundEnd(Battleground* battleground, TeamId /*winnerTeam*/) override
+    {
+        if (!battleground || !battleground->GetInstanceID())
+            return;
+
+        wowmin_telemetry_mapscript::CaptureBattleground(
+            battleground->GetBgMap(), GetSessionKey(battleground->GetMapId(), battleground->GetInstanceID()));
+    }
+};
+
 class wowmin_telemetry_unitscript : public UnitScript
 {
 public:
@@ -2950,6 +2978,7 @@ void AddSC_wowmin_telemetry()
 {
     new wowmin_telemetry_commandscript();
     new wowmin_telemetry_mapscript();
+    new wowmin_telemetry_battlegroundscript();
     new wowmin_telemetry_unitscript();
     new wowmin_telemetry_combatscript();
     new wowmin_telemetry_spellscript();
