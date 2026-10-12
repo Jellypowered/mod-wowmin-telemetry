@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/udp.hpp>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -22,14 +24,11 @@
 #include <utility>
 #include <vector>
 
-#include <boost/asio/io_context.hpp>
-#include <boost/asio/ip/udp.hpp>
-
 #include "AbstractFollower.h"
 #include "Battleground.h"
 #include "Chat.h"
-#include "Creature.h"
 #include "ConfigValueCache.h"
+#include "Creature.h"
 #include "DBCStores.h"
 #include "GameObject.h"
 #include "GameTime.h"
@@ -40,16 +39,16 @@
 #include "Log.h"
 #include "Map.h"
 #include "MotionMaster.h"
-#include "MovementGenerator.h"
 #include "MoveSpline.h"
+#include "MovementGenerator.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Player.h"
+#include "ScriptMgr.h"
 #include "Spell.h"
 #include "SpellAuraEffects.h"
 #include "SpellAuras.h"
 #include "SpellInfo.h"
-#include "ScriptMgr.h"
 #include "StringConvert.h"
 #include "TypeContainerVisitor.h"
 #include "Unit.h"
@@ -750,14 +749,14 @@ std::vector<std::vector<uint8>> BuildStreamDatagrams(uint32 mapId, uint32 instan
         datagram.reserve(STREAM_MAX_DATAGRAM);
         datagram.insert(datagram.end(), {'W', 'M', 'S', '1'});
         AppendU8(datagram, STREAM_VERSION);
-        AppendU8(datagram, 0); // part, patched below
-        AppendU8(datagram, 0); // partCount, patched below
+        AppendU8(datagram, 0);  // part, patched below
+        AppendU8(datagram, 0);  // partCount, patched below
         AppendU8(datagram, 0);
         AppendU32(datagram, mapId);
         AppendU32(datagram, instanceId);
         AppendU32(datagram, sequence);
         AppendU32(datagram, serverTimeMs);
-        AppendU16(datagram, 0); // playerCount, patched below
+        AppendU16(datagram, 0);  // playerCount, patched below
         AppendU16(datagram, 0);
     };
     startDatagram();
@@ -833,7 +832,7 @@ std::vector<std::vector<uint8>> PackEntries(std::string_view magic, uint32 mapId
             AppendU32(datagram, mapId);
             AppendU32(datagram, instanceId);
             AppendU32(datagram, serverTimeMs);
-            AppendU16(datagram, 0); // entry count, patched by finishDatagram
+            AppendU16(datagram, 0);  // entry count, patched by finishDatagram
             AppendU16(datagram, 0);
         }
         datagrams.back().insert(datagrams.back().end(), entry.begin(), entry.end());
@@ -1115,8 +1114,7 @@ std::vector<std::vector<uint8>> BuildCombatEventDatagrams(uint32 mapId, uint32 i
         AppendU16(entry, uint16(std::min<uint64>(serverTimeMs - std::min(event.atMs, serverTimeMs), 65535)));
         AppendU16(entry, event.extraFlags);
     }
-    std::vector<std::vector<uint8>> datagrams =
-        PackEntries("WME1", mapId, instanceId, uint32(serverTimeMs), entries);
+    std::vector<std::vector<uint8>> datagrams = PackEntries("WME1", mapId, instanceId, uint32(serverTimeMs), entries);
     if (!datagrams.empty())
     {
         uint16 const dropped = uint16(std::min<uint32>(droppedEvents, 65535));
@@ -1240,8 +1238,10 @@ public:
             _objects.push_back(object);
     }
 
-    template<class T>
-    void Visit(std::unordered_map<ObjectGuid, T*>&) {}
+    template <class T>
+    void Visit(std::unordered_map<ObjectGuid, T*>&)
+    {
+    }
 
 private:
     std::vector<GameObject*>& _objects;
@@ -1258,8 +1258,10 @@ public:
             _creatures.push_back(creature);
     }
 
-    template<class T>
-    void Visit(std::unordered_map<ObjectGuid, T*>&) {}
+    template <class T>
+    void Visit(std::unordered_map<ObjectGuid, T*>&)
+    {
+    }
 
 private:
     std::vector<Creature*>& _creatures;
@@ -1554,8 +1556,8 @@ public:
         }
         handler->PSendSysMessage("WSTREAM|{}|{}|{}|{}", STREAM_VERSION,
                                  telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::StreamPort),
-                                 std::max(STREAM_MIN_INTERVAL_MS,
-                                          telemetryConfig.GetConfigValue<uint32>(WowMinTelemetryConfig::StreamIntervalMs)),
+                                 std::max(STREAM_MIN_INTERVAL_MS, telemetryConfig.GetConfigValue<uint32>(
+                                                                      WowMinTelemetryConfig::StreamIntervalMs)),
                                  STREAM_SUBSCRIPTION_TTL_MS);
         return true;
     }
@@ -1857,18 +1859,11 @@ private:
                 flags |= 2;
             if (player->HasAura(SPELL_WAITING_FOR_RESURRECT))
                 flags |= 4;
-            players.push_back({player->GetGUID().GetCounter(),
-                               player->GetPositionX(),
-                               player->GetPositionY(),
-                               player->GetPositionZ(),
-                               player->GetOrientation(),
+            players.push_back({player->GetGUID().GetCounter(), player->GetPositionX(), player->GetPositionY(),
+                               player->GetPositionZ(), player->GetOrientation(),
                                uint8(std::clamp(player->GetHealthPct(), 0.0f, 100.0f)),
-                               uint8(std::clamp(player->GetPowerPct(powerType), 0.0f, 100.0f)),
-                               int8(powerType),
-                               flags,
-                               uint8(GetPlayerStateFlags(player)),
-                               GetUnitWmoGroupId(map, player),
-                               player->GetName()});
+                               uint8(std::clamp(player->GetPowerPct(powerType), 0.0f, 100.0f)), int8(powerType), flags,
+                               uint8(GetPlayerStateFlags(player)), GetUnitWmoGroupId(map, player), player->GetName()});
             CollectPathChange(player, player->GetGUID().GetCounter(), false, state->playerPaths, nowMs, paths);
             CollectPassenger(player, passengers);
             CollectAppearance(player, *state, nowMs, appearances);
@@ -1882,8 +1877,8 @@ private:
         // Forget players who have left, so a return is sent as new.
         for (auto iterator = state->playerPaths.begin(); iterator != state->playerPaths.end();)
         {
-            bool const present = std::any_of(players.begin(), players.end(),
-                [&](StreamPlayer const& player) { return player.guid == iterator->first; });
+            bool const present = std::any_of(players.begin(), players.end(), [&](StreamPlayer const& player)
+                                             { return player.guid == iterator->first; });
             iterator = present ? std::next(iterator) : state->playerPaths.erase(iterator);
         }
         std::erase_if(state->bots,
@@ -1934,9 +1929,11 @@ private:
             streamSender.Send(BuildGameObjectDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), gameObjects),
                               host, port);
         if (!debuffs.empty())
-            streamSender.Send(BuildDebuffDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), debuffs), host, port);
+            streamSender.Send(BuildDebuffDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), debuffs), host,
+                              port);
         if (sendMarkers)
-            streamSender.Send(BuildMarkerDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), markers), host, port);
+            streamSender.Send(BuildMarkerDatagrams(map->GetId(), map->GetInstanceId(), uint32(nowMs), markers), host,
+                              port);
         std::vector<StreamCombatEvent> events;
         uint32 droppedEvents = 0;
         {
@@ -2056,7 +2053,8 @@ private:
     // due a refresh; a unit with none is sent only as its last one goes.
     // Adds each spawned game object with a model that appeared, changed, or is
     // due a refresh to `objects`, and one marked gone for each that went.
-    static void CollectGameObjects(Map* map, StreamSessionState& state, uint64 nowMs, std::vector<StreamGameObject>& objects)
+    static void CollectGameObjects(Map* map, StreamSessionState& state, uint64 nowMs,
+                                   std::vector<StreamGameObject>& objects)
     {
         std::vector<GameObject*> present;
         StreamGameObjectCollector collector(present);
@@ -2076,11 +2074,17 @@ private:
             uint32 const guid = object->GetGUID().GetCounter();
             seen.insert(guid);
             G3D::Quat const rotation = object->GetWorldRotation();
-            StreamGameObject entry{guid, object->GetEntry(), object->GetDisplayId(), object->GetPositionX(),
-                                   object->GetPositionY(), object->GetPositionZ(),
+            StreamGameObject entry{guid,
+                                   object->GetEntry(),
+                                   object->GetDisplayId(),
+                                   object->GetPositionX(),
+                                   object->GetPositionY(),
+                                   object->GetPositionZ(),
                                    {rotation.x, rotation.y, rotation.z, rotation.w},
                                    uint16(std::clamp(object->GetObjectScale() * 1000.0f, 0.0f, 65535.0f)),
-                                   uint8(type), uint8(object->GetGoState()), false};
+                                   uint8(type),
+                                   uint8(object->GetGoState()),
+                                   false};
             std::size_t signature = std::hash<uint32>{}(entry.displayId);
             auto mix = [&](auto value) { MixSignature(signature, value); };
             mix(entry.state);
@@ -2128,12 +2132,14 @@ private:
             if (seat->m_flags & VEHICLE_SEAT_FLAG_CAN_CONTROL)
                 flags |= 4;
         }
-        passengers.push_back({player->GetGUID().GetCounter(), base->GetGUID().GetCounter(), flags, player->GetTransSeat()});
+        passengers.push_back(
+            {player->GetGUID().GetCounter(), base->GetGUID().GetCounter(), flags, player->GetTransSeat()});
     }
 
     // Adds the unit's harmful auras to `units` when the list changed (spells or
     // stacks), or is due a refresh while it isn't empty.
-    static void CollectDebuffs(Unit* unit, StreamSessionState& state, uint64 nowMs, std::vector<StreamUnitDebuffs>& units)
+    static void CollectDebuffs(Unit* unit, StreamSessionState& state, uint64 nowMs,
+                               std::vector<StreamUnitDebuffs>& units)
     {
         StreamUnitDebuffs entry{unit->GetGUID().GetCounter(), !unit->IsPlayer(), {}};
         std::size_t signature = 0;
@@ -2141,7 +2147,8 @@ private:
         {
             if (entry.debuffs.size() >= STREAM_MAX_DEBUFFS)
                 break;
-            if (!application || application->GetSlot() >= MAX_AURAS || application->IsPositive() || !application->GetBase())
+            if (!application || application->GetSlot() >= MAX_AURAS || application->IsPositive() ||
+                !application->GetBase())
                 continue;
             Aura const* aura = application->GetBase();
             if (aura->GetSpellInfo()->IsPassive())
@@ -2184,8 +2191,9 @@ private:
                 ObjectGuid const target = groupMarkers[icon];
                 if (!target)
                     continue;
-                bool const duplicate = std::any_of(markers.begin(), markers.end(), [&](StreamMarker const& marker)
-                    { return marker.icon == icon && marker.guid == target.GetCounter(); });
+                bool const duplicate =
+                    std::any_of(markers.begin(), markers.end(), [&](StreamMarker const& marker)
+                                { return marker.icon == icon && marker.guid == target.GetCounter(); });
                 if (duplicate)
                     continue;
                 markers.push_back({icon, !target.IsPlayer(), target.GetCounter()});
@@ -2203,7 +2211,8 @@ private:
         return true;
     }
 
-    static void CollectAuras(Unit* unit, StreamSessionState& state, uint64 nowMs, std::vector<StreamUnitAuras>& unitAuras)
+    static void CollectAuras(Unit* unit, StreamSessionState& state, uint64 nowMs,
+                             std::vector<StreamUnitAuras>& unitAuras)
     {
         StreamUnitAuras auras{unit->GetGUID().GetCounter(), !unit->IsPlayer(), {}};
         for (auto const& [spellId, application] : unit->GetAppliedAuras())
@@ -2304,10 +2313,10 @@ private:
             std::lock_guard<std::mutex> lock(log->mutex);
             revision = log->revision;
             for (auto entry = log->entries.rbegin(); entry != log->entries.rend(); ++entry)
-                bot.actions.push_back({entry->name, entry->relevance,
-                                       uint32(std::min<uint64>(nowMs > entry->atMs ? nowMs - entry->atMs : 0,
-                                                               UINT32_MAX)),
-                                       entry->repeats});
+                bot.actions.push_back(
+                    {entry->name, entry->relevance,
+                     uint32(std::min<uint64>(nowMs > entry->atMs ? nowMs - entry->atMs : 0, UINT32_MAX)),
+                     entry->repeats});
         }
 
         std::size_t signature = std::hash<std::string>{}(bot.strategies);
@@ -2705,10 +2714,7 @@ struct PendingSpellAmount
     bool periodic = false;
 };
 
-ObjectGuid GuidOf(Unit const* unit)
-{
-    return unit ? unit->GetGUID() : ObjectGuid::Empty;
-}
+ObjectGuid GuidOf(Unit const* unit) { return unit ? unit->GetGUID() : ObjectGuid::Empty; }
 
 thread_local PendingSpellAmount pendingDamage;
 thread_local PendingSpellAmount pendingHeal;
@@ -2783,7 +2789,8 @@ public:
         if (!streamAnySubscribed || !target || !attacker)
             return;
         uint64 const nowMs = GameTime::GetGameTimeMS().count();
-        if (lastSwing.attacker == attacker->GetGUID() && lastSwing.target == target->GetGUID() && lastSwing.atMs == nowMs)
+        if (lastSwing.attacker == attacker->GetGUID() && lastSwing.target == target->GetGUID() &&
+            lastSwing.atMs == nowMs)
             return;
         lastSwing = {attacker->GetGUID(), target->GetGUID(), nowMs};
         StreamCombatEvent event = MakeUnitEvent(STREAM_EVENT_SWING, attacker, target);
@@ -2816,7 +2823,8 @@ public:
             event.flags |= STREAM_EVENT_PERIODIC;
         if (damageType == DIRECT_DAMAGE)
             event.schoolMask = SPELL_SCHOOL_MASK_NORMAL;
-        else if (pendingDamage.spellInfo && pendingDamage.source == GuidOf(attacker) && pendingDamage.target == victim->GetGUID())
+        else if (pendingDamage.spellInfo && pendingDamage.source == GuidOf(attacker) &&
+                 pendingDamage.target == victim->GetGUID())
         {
             event.spellId = pendingDamage.spellInfo->Id;
             event.schoolMask = uint8(pendingDamage.spellInfo->SchoolMask);
@@ -2954,9 +2962,8 @@ class wowmin_telemetry_playerscript : public PlayerScript
 {
 public:
     wowmin_telemetry_playerscript()
-        : PlayerScript("wowmin_telemetry_playerscript",
-                       {PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_STORE_NEW_ITEM,
-                        PLAYERHOOK_ON_LOGOUT})
+        : PlayerScript("wowmin_telemetry_playerscript", {PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_LOOT_ITEM,
+                                                         PLAYERHOOK_ON_STORE_NEW_ITEM, PLAYERHOOK_ON_LOGOUT})
     {
     }
 
