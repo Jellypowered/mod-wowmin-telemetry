@@ -114,6 +114,7 @@ enum PlayerStateFlags : uint32
     PLAYER_STATE_SPIRIT_FORM = 1 << 4,
     PLAYER_STATE_FLAG_CARRIER = 1 << 5,
     PLAYER_STATE_FLYING = 1 << 6,
+    PLAYER_STATE_SITTING = 1 << 7,
 };
 constexpr uint32 SPELL_WARSONG_FLAG = 23333;
 constexpr uint32 SPELL_SILVERWING_FLAG = 23335;
@@ -201,6 +202,9 @@ uint32 GetPlayerStateFlags(Player* player)
         stateFlags |= PLAYER_STATE_SPIRIT_FORM;
     if (player->IsFlying())
         stateFlags |= PLAYER_STATE_FLYING;
+    // On the ground or in a chair (eating, drinking, resting).
+    if (player->IsSitState())
+        stateFlags |= PLAYER_STATE_SITTING;
     if (player->HasAura(SPELL_WARSONG_FLAG) || player->HasAura(SPELL_SILVERWING_FLAG) ||
         player->HasAura(SPELL_NETHERSTORM_FLAG))
         stateFlags |= PLAYER_STATE_FLAG_CARRIER;
@@ -233,7 +237,7 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //   player (30 bytes + name): u32 guid, f32 x, f32 y, f32 z, f32 orientation,
 //     u8 healthPct, u8 powerPct, i8 powerType, u8 flags (1 alive, 2 in combat,
 //     4 waiting to resurrect), u8 stateFlags (1 on a taxi, 2 mounted, 4 sapped,
-//     8 stunned, 16 spirit form, 32 carrying a flag, 64 flying), u8
+//     8 stunned, 16 spirit form, 32 carrying a flag, 64 flying, 128 sitting), u8
 //     nameLength, i32 wmoGroupId, name bytes
 // A snapshot larger than one datagram is split into parts sharing a sequence.
 //
