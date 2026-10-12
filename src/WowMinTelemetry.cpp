@@ -34,6 +34,7 @@
 #include "GameObject.h"
 #include "GameTime.h"
 #include "Group.h"
+#include "GroupMgr.h"
 #include "InstanceScript.h"
 #include "Item.h"
 #include "Log.h"
@@ -386,9 +387,9 @@ constexpr uint64 STREAM_GAMEOBJECT_REFRESH_MS = 10000;
 constexpr uint64 STREAM_DEBUFF_REFRESH_MS = 3000;
 constexpr std::size_t STREAM_MAX_DEBUFFS = 6;
 constexpr uint64 STREAM_MARKER_REFRESH_MS = 2000;
-// Gear is read when a unit is first seen and after a player equips or
-// unequips something; this re-read catches anything those hooks miss.
-constexpr uint64 STREAM_GEAR_REFRESH_MS = 60000;
+// A group's copied raid markers are dropped once no stream has asked for
+// them for this long.
+constexpr uint64 STREAM_GROUP_MARKERS_FORGET_MS = 10000;
 constexpr std::size_t STREAM_MAX_EVENTS = 256;
 constexpr std::size_t STREAM_MAX_UNIT_AURAS = 32;
 
@@ -460,22 +461,61 @@ struct StreamGear
     uint8 rangedSubclass = 0;
 };
 
-// Bumped when a player equips or unequips something, so streams re-read that
-// player's gear. Equip hooks can run outside the map thread.
-std::mutex gearRevisionMutex;
-std::unordered_map<uint32, uint32> gearRevisions;
+// Folds a value into a change-detection signature (boost's hash_combine
+// mix: the golden-ratio constant and two shifts).
+constexpr std::size_t SIGNATURE_MIX = 0x9e3779b97f4a7c15ULL;
 
-uint32 GetGearRevision(uint32 guid)
+template <class T>
+void MixSignature(std::size_t& signature, T const& value)
 {
-    std::lock_guard<std::mutex> lock(gearRevisionMutex);
-    auto const iterator = gearRevisions.find(guid);
-    return iterator == gearRevisions.end() ? 0 : iterator->second;
+    signature ^= std::hash<T>{}(value) + SIGNATURE_MIX + (signature << 6) + (signature >> 2);
 }
 
-void BumpGearRevision(uint32 guid)
+// Raid markers, copied for the groups the streams show. A group's markers are
+// set from the world thread (a player's /mark) and from map threads (bots mark
+// targets in their AI update), so a map thread must not read the group's own
+// while another map updates. Streams ask for their groups' markers here; the
+// world update copies them after every map has finished its update.
+using GroupMarkers = std::array<ObjectGuid, TARGETICONCOUNT>;
+struct CopiedGroupMarkers
 {
-    std::lock_guard<std::mutex> lock(gearRevisionMutex);
-    ++gearRevisions[guid];
+    GroupMarkers markers{};
+    uint64 askedAtMs = 0;
+};
+std::mutex groupMarkersMutex;
+std::unordered_map<ObjectGuid::LowType, CopiedGroupMarkers> groupMarkers;
+
+// Map thread: the groups' markers as last copied (none before the first
+// copy), each group's in the order given.
+std::vector<GroupMarkers> GetGroupMarkers(std::vector<ObjectGuid::LowType> const& groupIds, uint64 nowMs)
+{
+    std::vector<GroupMarkers> markers;
+    markers.reserve(groupIds.size());
+    std::lock_guard<std::mutex> lock(groupMarkersMutex);
+    for (ObjectGuid::LowType groupId : groupIds)
+    {
+        CopiedGroupMarkers& copied = groupMarkers[groupId];
+        copied.askedAtMs = nowMs;
+        markers.push_back(copied.markers);
+    }
+    return markers;
+}
+
+// World thread, after the maps' update: copies the asked-for groups' markers,
+// and forgets groups that have gone or that no stream has asked for lately.
+void CopyGroupMarkers(uint64 nowMs)
+{
+    std::lock_guard<std::mutex> lock(groupMarkersMutex);
+    std::erase_if(groupMarkers,
+                  [&](auto& entry)
+                  {
+                      Group* group = sGroupMgr->GetGroupByGUID(entry.first);
+                      if (!group || nowMs - entry.second.askedAtMs > STREAM_GROUP_MARKERS_FORGET_MS)
+                          return true;
+                      for (uint8 icon = 0; icon < TARGETICONCOUNT; ++icon)
+                          entry.second.markers[icon] = group->GetTargetIcon(icon);
+                      return false;
+                  });
 }
 
 // What was last sent for each path and creature, keyed by guid. Only the
@@ -511,9 +551,8 @@ struct StreamSessionState
     {
         uint64 sentAtMs = 0;
         std::size_t signature = 0;
-        bool gearRead = false;
-        uint64 gearReadAtMs = 0;
-        uint32 gearRevision = 0;
+        // The item entries the unit showed when its gear was last read.
+        std::optional<std::array<uint32, EQUIPMENT_SLOT_END>> gearEntries;
         StreamGear gear;
     };
     // Keyed by guid, with bit 32 set for creatures.
@@ -1176,16 +1215,16 @@ std::shared_ptr<BotActionLog> TrackBotActions(uint32 guid, Engine* engine)
         auto alive = std::make_shared<bool>(true);
         engine->AddActionExecutionListener(new BotActionRecorder(tracking.log, alive));
         tracking.engines.emplace_back(engine, alive);
-        // Forget bots whose engines have all gone, i.e. that logged out.
-        std::erase_if(botActionTracking,
-                      [&](auto const& entry)
-                      {
-                          return entry.first != guid &&
-                                 std::all_of(entry.second.engines.begin(), entry.second.engines.end(),
-                                             [](auto const& attached) { return attached.second.expired(); });
-                      });
     }
     return tracking.log;
+}
+
+// Forgets a bot's action log when it logs out; its engines, and the
+// recorders on them, go with it.
+void ForgetBotActions(uint32 guid)
+{
+    std::lock_guard<std::mutex> lock(botActionTrackingMutex);
+    botActionTracking.erase(guid);
 }
 #endif
 
@@ -1913,17 +1952,28 @@ private:
 
     // What the unit wears: the visible entry for players, so transmogrification
     // shows; creatures only have weapon slots.
-    static StreamGear ReadGear(Unit* unit)
+    // The item entries a unit shows: a player's visible items, a creature's
+    // virtual weapons. Plain update fields, so they are read every tick and
+    // a gear change is seen without equip hooks.
+    static std::array<uint32, EQUIPMENT_SLOT_END> ShownItemEntries(Unit* unit)
+    {
+        std::array<uint32, EQUIPMENT_SLOT_END> entries{};
+        for (uint8 slot = 0; slot < EQUIPMENT_SLOT_END; ++slot)
+        {
+            if (unit->IsPlayer())
+                entries[slot] = unit->GetUInt32Value(PLAYER_VISIBLE_ITEM_1_ENTRYID + slot * 2);
+            else if (slot >= EQUIPMENT_SLOT_MAINHAND && slot <= EQUIPMENT_SLOT_RANGED)
+                entries[slot] = unit->GetUInt32Value(UNIT_VIRTUAL_ITEM_SLOT_ID + slot - EQUIPMENT_SLOT_MAINHAND);
+        }
+        return entries;
+    }
+
+    static StreamGear ReadGear(std::array<uint32, EQUIPMENT_SLOT_END> const& entries)
     {
         StreamGear gear;
         for (uint8 slot = 0; slot < EQUIPMENT_SLOT_END; ++slot)
         {
-            uint32 itemEntry = 0;
-            if (unit->IsPlayer())
-                itemEntry = unit->GetUInt32Value(PLAYER_VISIBLE_ITEM_1_ENTRYID + slot * 2);
-            else if (slot >= EQUIPMENT_SLOT_MAINHAND && slot <= EQUIPMENT_SLOT_RANGED)
-                itemEntry = unit->GetUInt32Value(UNIT_VIRTUAL_ITEM_SLOT_ID + slot - EQUIPMENT_SLOT_MAINHAND);
-            ItemTemplate const* itemTemplate = GetItemTemplate(itemEntry);
+            ItemTemplate const* itemTemplate = GetItemTemplate(entries[slot]);
             if (!itemTemplate)
                 continue;
             gear.items[slot] = itemTemplate->DisplayInfoID;
@@ -1973,19 +2023,16 @@ private:
         uint64 const key = appearance.guid | (unit->IsPlayer() ? 0 : uint64(1) << 32);
         auto [iterator, inserted] = state.appearances.try_emplace(key);
         StreamSessionState::SentAppearance& sent = iterator->second;
-        uint32 const gearRevision = unit->IsPlayer() ? GetGearRevision(appearance.guid) : 0;
-        if (!sent.gearRead || gearRevision != sent.gearRevision || nowMs - sent.gearReadAtMs >= STREAM_GEAR_REFRESH_MS)
+        std::array<uint32, EQUIPMENT_SLOT_END> const entries = ShownItemEntries(unit);
+        if (sent.gearEntries != entries)
         {
-            sent.gear = ReadGear(unit);
-            sent.gearRead = true;
-            sent.gearReadAtMs = nowMs;
-            sent.gearRevision = gearRevision;
+            sent.gear = ReadGear(entries);
+            sent.gearEntries = entries;
         }
         appearance.gear = sent.gear;
 
         std::size_t signature = 0;
-        auto mix = [&](uint64 value)
-        { signature ^= std::hash<uint64>{}(value) + 0x9e3779b97f4a7c15ULL + (signature << 6) + (signature >> 2); };
+        auto mix = [&](uint64 value) { MixSignature(signature, value); };
         mix(appearance.flags);
         mix(appearance.race | appearance.gender << 8 | appearance.unitClass << 16 | appearance.sheathState << 24);
         mix(appearance.skin | appearance.face << 8 | appearance.hairStyle << 16 | appearance.hairColor << 24);
@@ -2035,7 +2082,7 @@ private:
                                    uint16(std::clamp(object->GetObjectScale() * 1000.0f, 0.0f, 65535.0f)),
                                    uint8(type), uint8(object->GetGoState()), false};
             std::size_t signature = std::hash<uint32>{}(entry.displayId);
-            auto mix = [&](auto value) { signature ^= std::hash<decltype(value)>{}(value) + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2); };
+            auto mix = [&](auto value) { MixSignature(signature, value); };
             mix(entry.state);
             mix(entry.scale);
             mix(int32(entry.x * 10.0f));
@@ -2103,8 +2150,8 @@ private:
             int32 const duration = aura->GetMaxDuration();
             entry.debuffs.push_back({aura->GetId(), uint32(std::max(0, remaining)), uint32(std::max(0, duration)),
                                      aura->GetStackAmount(), aura->GetCasterGUID().IsPlayer()});
-            signature ^= std::hash<uint32>{}(aura->GetId() * 31u + aura->GetStackAmount()) + 0x9e3779b97f4a7c15ull +
-                         (signature << 6) + (signature >> 2);
+            MixSignature(signature, aura->GetId());
+            MixSignature(signature, uint32(aura->GetStackAmount()));
         }
         if (!entry.debuffs.empty() && !signature)
             signature = 1;
@@ -2123,17 +2170,18 @@ private:
     // true when they should be sent (changed, or due a refresh while any are).
     static bool CollectMarkers(Map* map, StreamSessionState& state, uint64 nowMs, std::vector<StreamMarker>& markers)
     {
-        std::unordered_set<Group*> groups;
+        std::vector<ObjectGuid::LowType> groupIds;
         for (auto const& playerReference : map->GetPlayers())
             if (Player* player = playerReference.GetSource())
                 if (Group* group = player->GetGroup())
-                    groups.insert(group);
+                    if (std::find(groupIds.begin(), groupIds.end(), group->GetGUID().GetCounter()) == groupIds.end())
+                        groupIds.push_back(group->GetGUID().GetCounter());
         std::size_t signature = 0;
-        for (Group* group : groups)
+        for (GroupMarkers const& groupMarkers : GetGroupMarkers(groupIds, nowMs))
         {
             for (uint8 icon = 0; icon < TARGETICONCOUNT; ++icon)
             {
-                ObjectGuid const target = group->GetTargetIcon(icon);
+                ObjectGuid const target = groupMarkers[icon];
                 if (!target)
                     continue;
                 bool const duplicate = std::any_of(markers.begin(), markers.end(), [&](StreamMarker const& marker)
@@ -2141,8 +2189,7 @@ private:
                 if (duplicate)
                     continue;
                 markers.push_back({icon, !target.IsPlayer(), target.GetCounter()});
-                signature ^= std::hash<uint64>{}(target.GetRawValue() + icon) + 0x9e3779b97f4a7c15ull + (signature << 6) +
-                             (signature >> 2);
+                MixSignature(signature, target.GetRawValue() + icon);
             }
         }
         if (!markers.empty() && !signature)
@@ -2175,7 +2222,7 @@ private:
         std::sort(auras.spellIds.begin(), auras.spellIds.end());
         std::size_t signature = 0;
         for (uint32 spellId : auras.spellIds)
-            signature ^= std::hash<uint32>{}(spellId) + 0x9e3779b97f4a7c15ull + (signature << 6) + (signature >> 2);
+            MixSignature(signature, spellId);
         if (!auras.spellIds.empty() && !signature)
             signature = 1;
 
@@ -2264,8 +2311,7 @@ private:
         }
 
         std::size_t signature = std::hash<std::string>{}(bot.strategies);
-        auto mix = [&](uint64 value)
-        { signature ^= std::hash<uint64>{}(value) + 0x9e3779b97f4a7c15ULL + (signature << 6) + (signature >> 2); };
+        auto mix = [&](uint64 value) { MixSignature(signature, value); };
         mix(bot.state);
         mix(bot.motionType);
         mix(bot.movePriority);
@@ -2650,13 +2696,19 @@ StreamCombatEvent MakeCastEvent(uint8 kind, Spell* spell, Unit* caster, SpellInf
 // The spell behind the damage or heal the core is about to deal. Its hooks
 // say which spell it is but not the final amount; the hooks that follow on
 // the same thread give the amount but not the spell, so they are paired here.
+// Units are kept by GUID: a hook's units are only valid during that call.
 struct PendingSpellAmount
 {
-    Unit const* source = nullptr;
-    Unit const* target = nullptr;
+    ObjectGuid source;
+    ObjectGuid target;
     SpellInfo const* spellInfo = nullptr;
     bool periodic = false;
 };
+
+ObjectGuid GuidOf(Unit const* unit)
+{
+    return unit ? unit->GetGUID() : ObjectGuid::Empty;
+}
 
 thread_local PendingSpellAmount pendingDamage;
 thread_local PendingSpellAmount pendingHeal;
@@ -2664,8 +2716,8 @@ thread_local PendingSpellAmount pendingHeal;
 // Auto-attack swings are seen once per damage school; one is enough.
 struct LastSwing
 {
-    Unit const* attacker = nullptr;
-    Unit const* target = nullptr;
+    ObjectGuid attacker;
+    ObjectGuid target;
     uint64 atMs = 0;
 };
 
@@ -2731,9 +2783,9 @@ public:
         if (!streamAnySubscribed || !target || !attacker)
             return;
         uint64 const nowMs = GameTime::GetGameTimeMS().count();
-        if (lastSwing.attacker == attacker && lastSwing.target == target && lastSwing.atMs == nowMs)
+        if (lastSwing.attacker == attacker->GetGUID() && lastSwing.target == target->GetGUID() && lastSwing.atMs == nowMs)
             return;
-        lastSwing = {attacker, target, nowMs};
+        lastSwing = {attacker->GetGUID(), target->GetGUID(), nowMs};
         StreamCombatEvent event = MakeUnitEvent(STREAM_EVENT_SWING, attacker, target);
         event.schoolMask = SPELL_SCHOOL_MASK_NORMAL;
         RecordCombatEvent(attacker, event);
@@ -2742,14 +2794,14 @@ public:
     void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& /*damage*/, SpellInfo const* spellInfo) override
     {
         if (streamAnySubscribed)
-            pendingDamage = {attacker, target, spellInfo, false};
+            pendingDamage = {GuidOf(attacker), GuidOf(target), spellInfo, false};
     }
 
     void ModifyPeriodicDamageAurasTick(Unit* target, Unit* attacker, uint32& /*damage*/,
                                        SpellInfo const* spellInfo) override
     {
         if (streamAnySubscribed)
-            pendingDamage = {attacker, target, spellInfo, true};
+            pendingDamage = {GuidOf(attacker), GuidOf(target), spellInfo, true};
     }
 
     // The final amount, after armour, resistances, and absorbs.
@@ -2764,7 +2816,7 @@ public:
             event.flags |= STREAM_EVENT_PERIODIC;
         if (damageType == DIRECT_DAMAGE)
             event.schoolMask = SPELL_SCHOOL_MASK_NORMAL;
-        else if (pendingDamage.spellInfo && pendingDamage.source == attacker && pendingDamage.target == victim)
+        else if (pendingDamage.spellInfo && pendingDamage.source == GuidOf(attacker) && pendingDamage.target == victim->GetGUID())
         {
             event.spellId = pendingDamage.spellInfo->Id;
             event.schoolMask = uint8(pendingDamage.spellInfo->SchoolMask);
@@ -2783,7 +2835,7 @@ public:
         if (!streamAnySubscribed)
             return;
         bool const periodic = pendingDamage.periodic && pendingDamage.spellInfo == spellInfo;
-        pendingHeal = {healer, target, spellInfo, periodic};
+        pendingHeal = {GuidOf(healer), GuidOf(target), spellInfo, periodic};
         pendingDamage = {};
     }
 
@@ -2795,8 +2847,10 @@ public:
         StreamCombatEvent event = MakeUnitEvent(STREAM_EVENT_HEAL, healer, receiver);
         event.value = gain;
         event.flags |= STREAM_EVENT_HELPFUL;
-        bool const matches = (pendingHeal.source == healer && pendingHeal.target == receiver) ||
-                             (pendingHeal.source == receiver && pendingHeal.target == healer);
+        ObjectGuid const healerGuid = GuidOf(healer);
+        ObjectGuid const receiverGuid = receiver->GetGUID();
+        bool const matches = (pendingHeal.source == healerGuid && pendingHeal.target == receiverGuid) ||
+                             (pendingHeal.source == receiverGuid && pendingHeal.target == healerGuid);
         if (pendingHeal.spellInfo && matches)
         {
             event.spellId = pendingHeal.spellInfo->Id;
@@ -2902,21 +2956,18 @@ public:
     wowmin_telemetry_playerscript()
         : PlayerScript("wowmin_telemetry_playerscript",
                        {PLAYERHOOK_ON_LEVEL_CHANGED, PLAYERHOOK_ON_LOOT_ITEM, PLAYERHOOK_ON_STORE_NEW_ITEM,
-                        PLAYERHOOK_ON_EQUIP, PLAYERHOOK_ON_UNEQUIP_ITEM})
+                        PLAYERHOOK_ON_LOGOUT})
     {
     }
 
-    // Streams re-read a player's gear after either of these.
-    void OnPlayerEquip(Player* player, Item* /*item*/, uint8 /*bag*/, uint8 /*slot*/, bool /*update*/) override
+    void OnPlayerLogout(Player* player) override
     {
+#ifdef MOD_PLAYERBOTS
         if (player)
-            BumpGearRevision(player->GetGUID().GetCounter());
-    }
-
-    void OnPlayerUnequip(Player* player, Item* /*item*/) override
-    {
-        if (player)
-            BumpGearRevision(player->GetGUID().GetCounter());
+            ForgetBotActions(player->GetGUID().GetCounter());
+#else
+        (void)player;
+#endif
     }
 
     void OnPlayerLevelChanged(Player* player, uint8 oldLevel) override
@@ -2975,9 +3026,20 @@ private:
 class wowmin_telemetry_worldscript : public WorldScript
 {
 public:
-    wowmin_telemetry_worldscript() : WorldScript("wowmin_telemetry_worldscript", {WORLDHOOK_ON_BEFORE_CONFIG_LOAD}) {}
+    wowmin_telemetry_worldscript()
+        : WorldScript("wowmin_telemetry_worldscript", {WORLDHOOK_ON_BEFORE_CONFIG_LOAD, WORLDHOOK_ON_UPDATE})
+    {
+    }
 
     void OnBeforeConfigLoad(bool reload) override { telemetryConfig.Initialize(reload); }
+
+    // Runs after every map has finished its update (World::Update), so no map
+    // thread is setting raid markers while they are copied.
+    void OnUpdate(uint32 /*diff*/) override
+    {
+        if (streamAnySubscribed)
+            CopyGroupMarkers(GameTime::GetGameTimeMS().count());
+    }
 };
 }  // namespace
 
