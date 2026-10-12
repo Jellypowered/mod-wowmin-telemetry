@@ -2625,6 +2625,9 @@ StreamCombatEvent MakeCastEvent(uint8 kind, Spell* spell, Unit* caster, SpellInf
 {
     StreamCombatEvent event = MakeUnitEvent(kind, caster, spell->m_targets.GetUnitTarget());
     SetEventSpell(event, spellInfo, caster);
+    // The cast's own school, which the core sets for some spells: a wand's
+    // Shoot takes the wand's damage school.
+    event.schoolMask = uint8(spell->GetSpellSchoolMask());
     if (spell->IsTriggered())
         event.flags |= STREAM_EVENT_TRIGGERED;
     if (spell->m_targets.HasDst())
