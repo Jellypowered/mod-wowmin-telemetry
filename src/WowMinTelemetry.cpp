@@ -2383,7 +2383,8 @@ private:
     // it without a ring, facing, or path, so its path isn't sent.
     static bool IsScenery(Creature* creature)
     {
-        if (creature->HasUnitFlag(UNIT_FLAG_NOT_SELECTABLE))
+        // A totem is an object, whoever set it down.
+        if (creature->IsTotem() || creature->HasUnitFlag(UNIT_FLAG_NOT_SELECTABLE))
             return true;
         if (creature->IsInCombat() || creature->GetNpcFlags() != UNIT_NPC_FLAG_NONE)
             return false;
@@ -2406,7 +2407,7 @@ private:
         for (Creature* creature : present)
         {
             if (!creature->IsInWorld() || creature->IsDuringRemoveFromWorld() || creature->IsTrigger() ||
-                creature->IsTotem() || creature->IsCritter())
+                creature->IsCritter())
                 continue;
             uint32 const guid = creature->GetGUID().GetCounter();
             seen.insert(guid);
