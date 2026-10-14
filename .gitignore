@@ -30,7 +30,7 @@ CMakeLists.txt.user
 nbproject/
 .sync.ffs_db
 *.kate-swp
-
+.pi/
 #
 # Eclipse
 #
