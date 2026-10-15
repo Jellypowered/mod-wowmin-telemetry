@@ -36,6 +36,7 @@
 #include "GroupMgr.h"
 #include "InstanceScript.h"
 #include "Item.h"
+#include "LFG.h"
 #include "Log.h"
 #include "Map.h"
 #include "MotionMaster.h"
@@ -159,6 +160,25 @@ uint8 GetGroupRole(Group const* group, ObjectGuid playerGuid)
     return 0;
 }
 
+uint8 GetPlayerRole(Player* player)
+{
+    uint8 const groupRole = GetGroupRole(player->GetGroup(), player->GetGUID());
+    if (groupRole & (lfg::PLAYER_ROLE_TANK | lfg::PLAYER_ROLE_HEALER | lfg::PLAYER_ROLE_DAMAGE))
+        return groupRole;
+
+#ifdef MOD_PLAYERBOTS
+    // Manually assembled groups may have no core LFG role; playerbots can infer
+    // one from the bot's strategy or the player's specialization.
+    if (PlayerbotAI::IsTank(player))
+        return lfg::PLAYER_ROLE_TANK;
+    if (PlayerbotAI::IsHeal(player))
+        return lfg::PLAYER_ROLE_HEALER;
+    return lfg::PLAYER_ROLE_DAMAGE;
+#else
+    return groupRole;
+#endif
+}
+
 std::string EscapeTelemetryField(std::string_view value)
 {
     std::string escaped;
@@ -234,11 +254,12 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //   header (28 bytes): "WMS1", u8 version, u8 part, u8 partCount, u8 reserved,
 //     u32 mapId, u32 instanceId, u32 sequence, u32 serverTimeMs,
 //     u16 playerCount, u16 reserved
-//   player (30 bytes + name): u32 guid, f32 x, f32 y, f32 z, f32 orientation,
-//     u8 healthPct, u8 powerPct, i8 powerType, u8 flags (1 alive, 2 in combat,
-//     4 waiting to resurrect), u8 stateFlags (1 on a taxi, 2 mounted, 4 sapped,
-//     8 stunned, 16 spirit form, 32 carrying a flag, 64 flying, 128 sitting), u8
-//     nameLength, i32 wmoGroupId, name bytes
+//   player (31 bytes + name in version 2): u32 guid, f32 x, f32 y, f32 z,
+//     f32 orientation, u8 healthPct, u8 powerPct, i8 powerType, u8 flags
+//     (1 alive, 2 in combat, 4 waiting to resurrect), u8 stateFlags (1 on a
+//     taxi, 2 mounted, 4 sapped, 8 stunned, 16 spirit form, 32 carrying a flag,
+//     64 flying, 128 sitting), u8 roleMask (core LFG role bits), u8 nameLength,
+//     i32 wmoGroupId, name bytes. Version 1 omitted roleMask (30 bytes + name).
 // A snapshot larger than one datagram is split into parts sharing a sequence.
 //
 // Movement paths go in separate datagrams, sent alongside a snapshot when a
@@ -363,7 +384,7 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //     Consecration; its cast-fired event then carries the area's duration in
 //     value, as a channel's does)
 
-constexpr uint8 STREAM_VERSION = 1;
+constexpr uint8 STREAM_VERSION = 2;
 constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
 constexpr std::size_t STREAM_MAX_SUBSCRIPTIONS = 64;
 constexpr std::size_t STREAM_MAX_DATAGRAM = 1200;
@@ -594,6 +615,7 @@ struct StreamPlayer
     int8 powerType;
     uint8 flags;
     uint8 stateFlags;
+    uint8 roleMask;
     int32 wmoGroupId;
     std::string name;
 };
@@ -771,7 +793,7 @@ std::vector<std::vector<uint8>> BuildStreamDatagrams(uint32 mapId, uint32 instan
     for (StreamPlayer const& player : players)
     {
         std::size_t const nameLength = std::min(player.name.size(), STREAM_MAX_NAME);
-        if (count && datagrams.back().size() + 30 + nameLength > STREAM_MAX_DATAGRAM)
+        if (count && datagrams.back().size() + 31 + nameLength > STREAM_MAX_DATAGRAM)
         {
             finishDatagram();
             startDatagram();
@@ -787,6 +809,7 @@ std::vector<std::vector<uint8>> BuildStreamDatagrams(uint32 mapId, uint32 instan
         AppendU8(datagram, uint8(player.powerType));
         AppendU8(datagram, player.flags);
         AppendU8(datagram, player.stateFlags);
+        AppendU8(datagram, player.roleMask);
         AppendU8(datagram, uint8(nameLength));
         AppendU32(datagram, uint32(player.wmoGroupId));
         datagram.insert(datagram.end(), player.name.begin(), player.name.begin() + nameLength);
@@ -1645,7 +1668,7 @@ public:
                                    target ? target->GetGUID().GetCounter() : 0,
                                    target ? target->GetTypeId() : TYPEID_OBJECT,
                                    target ? target->GetName() : "",
-                                   GetGroupRole(group, player->GetGUID()),
+                                   GetPlayerRole(player),
                                    player->HasAura(SPELL_WAITING_FOR_RESURRECT),
                                    battlegroundRole,
                                    wmoGroupId,
@@ -1863,7 +1886,8 @@ private:
                                player->GetPositionZ(), player->GetOrientation(),
                                uint8(std::clamp(player->GetHealthPct(), 0.0f, 100.0f)),
                                uint8(std::clamp(player->GetPowerPct(powerType), 0.0f, 100.0f)), int8(powerType), flags,
-                               uint8(GetPlayerStateFlags(player)), GetUnitWmoGroupId(map, player), player->GetName()});
+                               uint8(GetPlayerStateFlags(player)), GetPlayerRole(player),
+                               GetUnitWmoGroupId(map, player), player->GetName()});
             CollectPathChange(player, player->GetGUID().GetCounter(), false, state->playerPaths, nowMs, paths);
             CollectPassenger(player, passengers);
             CollectAppearance(player, *state, nowMs, appearances);

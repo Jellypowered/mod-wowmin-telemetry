@@ -50,8 +50,9 @@ instances through the core API.
 
 The module remains usable without `mod-playerbots`. When both modules are compiled, the optional
 integration reports the read-only server-selected team strategy and per-bot `bg role`; unavailable
-values are `-1`. WoWMin never changes either value. Version 2 fields retain their original meanings,
-including the core LFG role mask in `roleMask`.
+values are `-1`. WoWMin never changes either value. Version 2 fields retain their original meanings.
+`roleMask` uses the core LFG assignment when present; with `mod-playerbots`, its strategy/spec-aware
+classification supplies Tank, Heal, or DPS for manually assembled groups that have no LFG role.
 
 ### Building with `mod-playerbots`
 
@@ -86,12 +87,14 @@ stops by itself when renewals stop. Datagrams go only to `WowMinTelemetry.Stream
 `.Port`; the command cannot redirect them. They are not encrypted, so keep the destination on
 localhost or a trusted network.
 
-Every datagram starts with a four-byte magic and a version byte (1). The layouts, little-endian,
+Every datagram starts with a four-byte magic and a version byte (currently 2). Stream version 2 adds the
+core LFG role mask to each `WMS1` player record so dungeon/raid roles remain available when WoWMin is using
+the character-database snapshot fallback; readers retain support for version 1. The layouts, little-endian,
 are documented beside the code in `src/WowMinTelemetry.cpp`:
 
 | Magic | Carries | Sent |
 |---|---|---|
-| `WMS1` | Players: position, facing, health, power, state, WMO group, name | Every interval, split into parts when large |
+| `WMS1` | Player position, state, role, WMO group, and name | Every interval; split when large |
 | `WMP1` | Movement paths (waypoints still ahead) of players, bots, and mobs | When a path changes, and every second |
 | `WMC1` | Creatures: entry, position, health, hostility, boss, target | When they move or change, and every second |
 | `WMB1` | Playerbot decisions: state, move target, strategies, recent actions (with `mod-playerbots`) | When they change, at most 4 a second, and every second |
