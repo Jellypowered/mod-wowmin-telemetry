@@ -1,10 +1,32 @@
 name: Codestyle Checks
+
 on:
   push:
     branches:
-      - 'master'
+      - main
+      - testing
   pull_request:
+
+permissions:
+  contents: read
 
 jobs:
   codestyle:
     uses: azerothcore/reusable-workflows/.github/workflows/codestyle_modules.yml@main
+
+  clang-format:
+    name: clang-format
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang-format-18
+
+      - name: Verify C++ formatting
+        run: |
+          find src -type f \( -name '*.cpp' -o -name '*.h' -o -name '*.hpp' \) -print0 \
+            | xargs -0 --no-run-if-empty clang-format-18 --dry-run --Werror

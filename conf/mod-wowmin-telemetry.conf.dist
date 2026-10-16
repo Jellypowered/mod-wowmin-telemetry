@@ -9,9 +9,11 @@
 ########################################
 #
 #    WowMinTelemetry.Enable
-#        Description: Enables the administrator-only "wowmin telemetry" command.
-#                     The command exposes live in-memory player state through the
-#                     existing authenticated worldserver command transport.
+#        Description: Enables text snapshot/event collection and the administrator-only
+#                     "wowmin telemetry" command over the existing authenticated
+#                     worldserver command transport. Disabled skips collection;
+#                     existing bounded history is retained until map destruction.
+#                     Lifecycle bookkeeping and cleanup remain active.
 #        Default:     0 - Disabled
 #                     1 - Enabled
 #
@@ -28,7 +30,11 @@ WowMinTelemetry.Enable = 0
 #                     how each unit looks (display, gear, sheathed weapons) for
 #                     drawing models, and, with mod-playerbots, what each bot
 #                     is deciding.
-#                     Requires WowMinTelemetry.Enable.
+#                     Requires WowMinTelemetry.Enable. Disabling either option on
+#                     reload discards active subscriptions and queued stream data;
+#                     re-enabling requires new subscriptions. Text history is retained.
+#                     The world thread drains a 2048-datagram queue after map updates.
+#                     Batches that cannot fit are dropped whole; reload discards the queue.
 #        Default:     0 - Disabled
 #                     1 - Enabled
 #
@@ -41,7 +47,9 @@ WowMinTelemetry.Stream.Enable = 0
 #        Description: Destination for stream datagrams: the machine and UDP port
 #                     wowmin listens on (WOWMIN_STREAM_PORT). Use an IP address,
 #                     not a host name. Keep this on localhost or a trusted
-#                     network; datagrams are not encrypted.
+#                     network; datagrams are not encrypted. Failed validation or
+#                     socket opening retries at most every five seconds while watched.
+#                     Changing host/port retries immediately; no fallback is used.
 #        Default:     "127.0.0.1", 7979
 #
 

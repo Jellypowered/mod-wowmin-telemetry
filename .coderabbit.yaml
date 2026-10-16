@@ -1,0 +1,172 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# Review policy for mod-wowmin-telemetry. This combines the applicable
+# AzerothCore and mod-playerbots rules without importing AI-specific checks.
+language: en-US
+
+tone_instructions: |
+  Be terse: at most three sentences per finding. Report only actionable problems.
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  fail_commit_status: false
+
+  high_level_summary: false
+  changed_files_summary: false
+  sequence_diagrams: false
+  estimate_code_review_effort: false
+  assess_linked_issues: false
+  related_issues: false
+  related_prs: false
+  suggested_labels: false
+  suggested_reviewers: false
+  review_status: false
+  review_details: false
+  in_progress_fortune: false
+  poem: false
+  enable_prompt_for_ai_agents: false
+  collapse_walkthrough: true
+
+  pre_merge_checks:
+    docstrings:
+      mode: "off"
+    title:
+      mode: "off"
+    description:
+      mode: "off"
+    issue_assessment:
+      mode: "off"
+
+  finishing_touches:
+    docstrings:
+      enabled: false
+    unit_tests:
+      enabled: false
+    simplify:
+      enabled: false
+    autofix:
+      enabled: false
+    fix_ci:
+      enabled: false
+    resolve_merge_conflict:
+      enabled: false
+
+  auto_review:
+    enabled: true
+    auto_incremental_review: false
+    drafts: false
+    base_branches:
+      - "main"
+    ignore_title_keywords:
+      - "WIP"
+      - "DO NOT MERGE"
+      - "skip-review"
+
+  path_filters:
+    - "!.pi/**"
+    - "!LICENSE"
+    - "!**/*.png"
+
+  path_instructions:
+    - path: ".agents/**"
+      instructions: |
+        Preserve self-review scope: default/current covers only uncommitted staged, unstaged, and
+        non-ignored untracked changes; full audits the current module repository; staged reviews exact
+        index content, not unstaged disk edits. Never stage fixes automatically or report disk-only
+        fixes as resolved in staged content. Reports must state mode, exclusions, and missing coverage.
+
+    - path: "src/**/*.{cpp,h,hpp}"
+      instructions: |
+        Apply AzerothCore C++20 conventions:
+        - Use the repository .clang-format: four spaces, no tabs, Allman braces, 120-column limit,
+          UTF-8, LF, no trailing whitespace, and a trailing newline.
+        - Do not wrap a single-line statement in braces. Write `if (x)`, not `if(x)` or `if ( x )`.
+        - Bind pointers and references to the type and put const after it: `Player const* player` and
+          `auto const& value`. Put `static` first and suffix floating-point literals with `f`.
+        - Use UpperCamelCase for functions, lowerCamelCase for locals and parameters, and
+          `_lowerCamelCase` for private data members. Prefer named constexpr values to magic numbers.
+        - Use fmt-style `{}` formatting and AzerothCore LOG_* macros. Do not use printf formatting,
+          `printf`, `sLog->`, or TC_LOG_*.
+        - Use helpers from Random.h instead of rand(), std::rand, or <random>. Use `Acore::`, never
+          leftover `Trinity::` names.
+        - Read configuration at startup or reload with `sConfigMgr->GetOption<T>()`, cache it, and do
+          not query configuration in per-update hot paths.
+        - Use typed object and flag helpers instead of raw type/flag fields. ObjectGuid::GetCounter()
+          is permitted only where the documented telemetry wire format requires a numeric low GUID.
+        - Never retain a raw Player*, Creature*, Unit*, Map*, or session pointer beyond the current
+          call or update. Retain ObjectGuid or scalar snapshot data and resolve it when needed.
+        - Use prepared statements for database access, async reads on map/update paths, and a
+          SQLTransaction for multi-statement writes.
+        - Check every lookup and conversion before dereference and reject objects from another map.
+          An override must preserve the base implementation's guards and required side effects.
+
+        Apply the relevant mod-playerbots integration rules:
+        - The module must compile and remain useful without mod-playerbots. Playerbots headers,
+          symbols, hooks, and behavior must be guarded by MOD_PLAYERBOTS.
+        - Map updates and playerbot AI run on map threads. Do not read or mutate groups, guilds,
+          sessions, or other non-thread-safe world state there; queue work through
+          PlayerbotWorldThreadProcessor or maintain a world-thread-produced synchronized snapshot.
+        - Protect shared mutable state with an appropriate mutex or atomic. Do not hold a lock while
+          sending network traffic, formatting large responses, or doing other unbounded work.
+        - Do not perform synchronous database queries from hooks or paths reachable per player,
+          creature, bot, map update, or telemetry interval.
+        - Treat per-update work as a hot path across many maps and units. Bound collection sizes,
+          cache expensive scans, and gate work before iterating world objects.
+        - Calls into PlayerbotAI must use APIs present in the checked-out mod-playerbots source and
+          must be safe for human players as well as bots when both can reach the call.
+        - Do not change playerbot state, strategies, actions, roles, or movement; this integration is
+          observational only.
+
+        Apply telemetry-specific safety and compatibility rules:
+        - Wire-format changes must update the protocol version, encoded entry size, packet splitting
+          calculation, field order, reserved offsets, and README/code documentation together.
+        - STREAM_VERSION is shared by every datagram type. Flag a version change unless compatibility
+          for every emitted magic is intentional and readers can distinguish the new version.
+        - Keep datagrams within STREAM_MAX_DATAGRAM, cap variable-length fields before narrowing,
+          and ensure part/count fields cannot overflow their encoded widths.
+        - Never allow a chat command or packet to select the UDP destination. Keep host and port
+          server-configured, and preserve subscription expiry and bounded subscriber state.
+        - Snapshot map-owned object data on its owning map thread. Transfer only owned values across
+          threads; do not transfer live object pointers.
+        - Verify claims about core or playerbots behavior against the checked-out source. Do not rely
+          on remembered AzerothCore, TrinityCore, or game behavior.
+
+        Comments should explain only non-obvious constraints, protocol contracts, or safety reasons;
+        do not narrate change history. Comments over two lines require genuinely exceptional context,
+        with wire-format documentation explicitly considered exceptional.
+
+    - path: "conf/*.conf.dist"
+      instructions: |
+        Keep options under the WowMinTelemetry namespace, document units and security implications,
+        choose conservative defaults, and ensure each option is loaded and cached at startup/reload.
+
+    - path: "README.md"
+      instructions: |
+        Keep commands, configuration defaults, optional mod-playerbots behavior, protocol versions,
+        packet layouts, and compatibility claims synchronized with the checked-out implementation.
+        Follow .editorconfig, including its 120-column limit.
+
+  tools:
+    # Core headers and compile_commands.json are unavailable to CodeRabbit's standalone analyzers.
+    # cppcheck 2.17 also reports false invalidContainerReference errors for references returned by
+    # vector::emplace_back(). The repository-owned CI below performs deterministic style checks.
+    clang:
+      enabled: false
+    fbinfer:
+      enabled: false
+    cppcheck:
+      enabled: false
+    languagetool:
+      enabled: false
+
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns:
+      - "AGENTS.md"
+      - ".agents/docs/*.md"
+      - ".agents/skills/self-review/SKILL.md"
+      - "README.md"
+
+chat:
+  auto_reply: true

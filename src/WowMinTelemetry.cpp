@@ -160,10 +160,10 @@ uint8 GetGroupRole(Group const* group, ObjectGuid playerGuid)
     return 0;
 }
 
-uint8 GetPlayerRole(Player* player)
+uint8 GetStreamPlayerRole(Player* player, Group const* group)
 {
-    uint8 const groupRole = GetGroupRole(player->GetGroup(), player->GetGUID());
-    if (groupRole & (lfg::PLAYER_ROLE_TANK | lfg::PLAYER_ROLE_HEALER | lfg::PLAYER_ROLE_DAMAGE))
+    uint8 const groupRole = GetGroupRole(group, player->GetGUID());
+    if (!group || (groupRole & (lfg::PLAYER_ROLE_TANK | lfg::PLAYER_ROLE_HEALER | lfg::PLAYER_ROLE_DAMAGE)))
         return groupRole;
 
 #ifdef MOD_PLAYERBOTS
@@ -243,22 +243,38 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
     return wmoGroupId;
 }
 
+constexpr uint32 STREAM_GUID_TYPE_SHIFT = 24;
+constexpr uint32 STREAM_GUID_TYPE_MASK = 0xFF;
+
+// Non-player counters are only unique within a high-GUID type. Stream v3
+// keeps that type in the upper byte; player IDs retain their full low GUID.
+uint32 GetStreamUnitId(ObjectGuid guid)
+{
+    if (!guid || guid.IsPlayer())
+        return guid.GetCounter();
+    return guid.GetCounter() | ((uint32(guid.GetHigh()) & STREAM_GUID_TYPE_MASK) << STREAM_GUID_TYPE_SHIFT);
+}
+
 // ── Position stream ──────────────────────────────────────────
 //
 // wowmin subscribes to a session with "wowmin stream <mapId> <instanceId>" and
-// renews it every few seconds. While subscribed, the session's map update
-// sends a UDP snapshot of its players to the configured destination (never one
-// chosen by the command) every WowMinTelemetry.Stream.IntervalMs.
+// renews it every few seconds. While subscribed, the map queues snapshots at
+// WowMinTelemetry.Stream.IntervalMs. The world thread sends them after maps
+// join, only to the configured destination (never one chosen by a command).
 //
-// Datagram, little-endian:
+// Datagram, little-endian. In version 3, every unit GUID field below uses
+// GetStreamUnitId: players keep their low GUID; non-players carry the low
+// byte of HighGuid in bits 24..31 and their counter in bits 0..23. The
+// existing player/creature flags still distinguish those two namespaces.
+// Game-object records have their own namespace and retain their low GUID.
 //   header (28 bytes): "WMS1", u8 version, u8 part, u8 partCount, u8 reserved,
 //     u32 mapId, u32 instanceId, u32 sequence, u32 serverTimeMs,
 //     u16 playerCount, u16 reserved
-//   player (31 bytes + name in version 2): u32 guid, f32 x, f32 y, f32 z,
+//   player (31 bytes + name from version 2): u32 guid, f32 x, f32 y, f32 z,
 //     f32 orientation, u8 healthPct, u8 powerPct, i8 powerType, u8 flags
 //     (1 alive, 2 in combat, 4 waiting to resurrect), u8 stateFlags (1 on a
 //     taxi, 2 mounted, 4 sapped, 8 stunned, 16 spirit form, 32 carrying a flag,
-//     64 flying, 128 sitting), u8 roleMask (core LFG role bits), u8 nameLength,
+//     64 flying, 128 sitting), u8 roleMask (assigned/inferred LFG role bits), u8 nameLength,
 //     i32 wmoGroupId, name bytes. Version 1 omitted roleMask (30 bytes + name).
 // A snapshot larger than one datagram is split into parts sharing a sequence.
 //
@@ -384,12 +400,14 @@ int32 GetUnitWmoGroupId(Map* map, Unit* unit)
 //     Consecration; its cast-fired event then carries the area's duration in
 //     value, as a channel's does)
 
-constexpr uint8 STREAM_VERSION = 2;
+constexpr uint8 STREAM_VERSION = 3;
 constexpr uint64 STREAM_SUBSCRIPTION_TTL_MS = 10000;
 constexpr std::size_t STREAM_MAX_SUBSCRIPTIONS = 64;
 constexpr std::size_t STREAM_MAX_DATAGRAM = 1200;
+constexpr std::size_t STREAM_MAX_QUEUED_DATAGRAMS = 2048;
 constexpr std::size_t STREAM_MAX_NAME = 48;
 constexpr uint32 STREAM_MIN_INTERVAL_MS = 20;
+constexpr uint64 STREAM_SENDER_RETRY_MS = 5000;
 constexpr std::size_t STREAM_MAX_PATH_POINTS = 32;
 constexpr uint64 STREAM_PATH_REFRESH_MS = 1000;
 constexpr uint64 STREAM_CREATURE_REFRESH_MS = 1000;
@@ -538,8 +556,13 @@ void CopyGroupMarkers(uint64 nowMs)
                   });
 }
 
-// What was last sent for each path and creature, keyed by guid. Only the
-// session's map thread uses it.
+struct StreamPlayerGroup
+{
+    ObjectGuid::LowType groupId = 0;
+    uint8 role = 0;
+};
+
+// Sent-state caches are map-owned; groups and events have separate mutexes.
 struct StreamSessionState
 {
     struct SentPath
@@ -582,6 +605,10 @@ struct StreamSessionState
     std::unordered_map<uint32, SentSignature> gameObjects;
     std::unordered_map<uint64, SentSignature> debuffs;
     SentSignature markers;
+    std::mutex groupMutex;
+    std::unordered_set<ObjectGuid> groupPlayers;
+    std::unordered_map<ObjectGuid, StreamPlayerGroup> groups;
+    bool groupRefreshRequested = false;
     // Filled by the combat hooks and emptied by each snapshot. The hooks
     // normally run on the session's map thread, but take no chances.
     std::mutex eventMutex;
@@ -602,6 +629,78 @@ std::unordered_map<uint64, StreamSubscription> streamSubscriptions;
 // Lets the combat hooks, which run for every unit, skip the lock while nobody
 // is watching. Updated with streamSubscriptions, under streamStateMutex.
 std::atomic<bool> streamAnySubscribed = false;
+
+// Caller holds streamStateMutex and releases returned states outside it.
+// Expiry must not depend on a map updating.
+std::vector<std::shared_ptr<StreamSessionState>> ExpireStreamSubscriptionsLocked(uint64 nowMs)
+{
+    std::vector<std::shared_ptr<StreamSessionState>> expiredStates;
+    std::erase_if(streamSubscriptions,
+                  [&](auto const& entry)
+                  {
+                      if (entry.second.expiresAtMs > nowMs)
+                          return false;
+                      expiredStates.push_back(entry.second.state);
+                      return true;
+                  });
+    streamAnySubscribed = !streamSubscriptions.empty();
+    return expiredStates;
+}
+
+// World thread after map joins: resolve only the players requested by streams.
+void CopyStreamPlayerGroups()
+{
+    std::vector<std::pair<uint64, std::shared_ptr<StreamSessionState>>> states;
+    {
+        std::lock_guard<std::mutex> lock(streamStateMutex);
+        for (auto const& [sessionKey, subscription] : streamSubscriptions)
+            states.emplace_back(sessionKey, subscription.state);
+    }
+    for (auto const& [sessionKey, state] : states)
+    {
+        std::unordered_set<ObjectGuid> requested;
+        {
+            std::lock_guard<std::mutex> lock(state->groupMutex);
+            if (!state->groupRefreshRequested)
+                continue;
+            requested = state->groupPlayers;
+            state->groupRefreshRequested = false;
+        }
+        std::unordered_map<ObjectGuid, StreamPlayerGroup> copied;
+        for (ObjectGuid guid : requested)
+        {
+            Player* player = ObjectAccessor::FindPlayer(guid);
+            if (!player || !player->IsInWorld() ||
+                GetSessionKey(player->GetMapId(), player->GetInstanceId()) != sessionKey)
+                continue;
+            Group* group = player->GetGroup();
+            copied.emplace(
+                guid, StreamPlayerGroup{group ? group->GetGUID().GetCounter() : 0, GetStreamPlayerRole(player, group)});
+        }
+        {
+            std::lock_guard<std::mutex> lock(state->groupMutex);
+            state->groups.swap(copied);
+        }
+    }
+}
+
+void ForgetStreamPlayerGroups(ObjectGuid guid)
+{
+    if (!streamAnySubscribed)
+        return;
+    std::vector<std::shared_ptr<StreamSessionState>> states;
+    {
+        std::lock_guard<std::mutex> lock(streamStateMutex);
+        for (auto const& [sessionKey, subscription] : streamSubscriptions)
+            states.push_back(subscription.state);
+    }
+    for (auto const& state : states)
+    {
+        std::lock_guard<std::mutex> lock(state->groupMutex);
+        state->groupPlayers.erase(guid);
+        state->groups.erase(guid);
+    }
+}
 
 struct StreamPlayer
 {
@@ -1211,41 +1310,98 @@ private:
     std::shared_ptr<bool> _alive;
 };
 
-// Each streamed bot's action log, and the engines recording into it. Bots on
-// different maps update on different threads, hence the mutex.
+// Each streamed bot's action log, and its lifetime-guarded engine attachments.
 struct BotActionTracking
 {
+    struct AttachedEngine
+    {
+        Engine* engine;
+        BotActionRecorder* recorder;
+        std::weak_ptr<bool> alive;
+    };
     std::shared_ptr<BotActionLog> log = std::make_shared<BotActionLog>();
-    std::vector<std::pair<Engine const*, std::weak_ptr<bool>>> engines;
+    std::vector<AttachedEngine> engines;
 };
 std::mutex botActionTrackingMutex;
 std::unordered_map<uint32, BotActionTracking> botActionTracking;
+std::atomic<bool> botAnyTracked = false;
 
-// Returns the bot's action log, first adding a recorder to `engine` (its
-// current one) if it has none. A bot's engines change with combat, so each
-// gets one as it comes into use.
+// World thread while maps are quiescent; an expired token forbids dereference.
+void DetachBotActions(BotActionTracking& tracking)
+{
+    for (auto const& attached : tracking.engines)
+    {
+        if (attached.alive.expired())
+            continue;
+        attached.engine->removeActionExecutionListener(attached.recorder);
+        delete attached.recorder;
+    }
+}
+
+// Returns the bot's log, attaching once to each current engine on its map thread.
 std::shared_ptr<BotActionLog> TrackBotActions(uint32 guid, Engine* engine)
 {
     std::lock_guard<std::mutex> lock(botActionTrackingMutex);
     BotActionTracking& tracking = botActionTracking[guid];
-    std::erase_if(tracking.engines, [](auto const& attached) { return attached.second.expired(); });
+    botAnyTracked = true;
+    std::erase_if(tracking.engines, [](auto const& attached) { return attached.alive.expired(); });
     bool const recorded = std::any_of(tracking.engines.begin(), tracking.engines.end(),
-                                      [&](auto const& attached) { return attached.first == engine; });
+                                      [&](auto const& attached) { return attached.engine == engine; });
     if (engine && !recorded)
     {
         auto alive = std::make_shared<bool>(true);
-        engine->AddActionExecutionListener(new BotActionRecorder(tracking.log, alive));
-        tracking.engines.emplace_back(engine, alive);
+        auto* recorder = new BotActionRecorder(tracking.log, alive);
+        engine->AddActionExecutionListener(recorder);
+        tracking.engines.push_back({engine, recorder, alive});
     }
     return tracking.log;
 }
 
-// Forgets a bot's action log when it logs out; its engines, and the
-// recorders on them, go with it.
+// Logout runs on the world thread; detach before an engine can outlive its log.
 void ForgetBotActions(uint32 guid)
 {
-    std::lock_guard<std::mutex> lock(botActionTrackingMutex);
-    botActionTracking.erase(guid);
+    std::optional<BotActionTracking> retired;
+    {
+        std::lock_guard<std::mutex> lock(botActionTrackingMutex);
+        auto const iterator = botActionTracking.find(guid);
+        if (iterator == botActionTracking.end())
+            return;
+        retired.emplace(std::move(iterator->second));
+        botActionTracking.erase(iterator);
+        botAnyTracked = !botActionTracking.empty();
+    }
+    DetachBotActions(*retired);
+}
+
+// World thread after map joins (or during config reload), never a map callback.
+void RetireUnobservedBotActions()
+{
+    if (!botAnyTracked)
+        return;
+    std::unordered_set<uint32> observed;
+    {
+        std::lock_guard<std::mutex> lock(streamStateMutex);
+        for (auto const& [sessionKey, subscription] : streamSubscriptions)
+            for (auto const& [guid, sent] : subscription.state->bots)
+                observed.insert(guid);
+    }
+    std::vector<BotActionTracking> retired;
+    {
+        std::lock_guard<std::mutex> lock(botActionTrackingMutex);
+        for (auto iterator = botActionTracking.begin(); iterator != botActionTracking.end();)
+        {
+            if (observed.contains(iterator->first))
+            {
+                ++iterator;
+                continue;
+            }
+            retired.push_back(std::move(iterator->second));
+            iterator = botActionTracking.erase(iterator);
+        }
+        botAnyTracked = !botActionTracking.empty();
+    }
+    for (BotActionTracking& tracking : retired)
+        DetachBotActions(tracking);
 }
 #endif
 
@@ -1318,16 +1474,76 @@ std::vector<G3D::Vector3> GetRemainingPath(Unit* unit, bool& truncated)
     return points;
 }
 
-// One non-blocking UDP socket shared by every map thread. Sends are a single
-// kernel copy each, so a mutex is cheaper than handing off to another thread.
+// Map threads enqueue owned batches; the world thread owns socket I/O.
+// Over-capacity batches are dropped whole, as best-effort UDP traffic.
 class StreamSender
 {
-public:
-    void Send(std::vector<std::vector<uint8>> const& datagrams, std::string_view host, uint32 port)
+    struct PendingBatch
     {
-        std::lock_guard<std::mutex> lock(_mutex);
-        if (!_socket || host != _host || port != _port)
+        std::vector<std::vector<uint8>> datagrams;
+        std::string host;
+        uint32 port;
+    };
+
+public:
+    void Send(std::vector<std::vector<uint8>> datagrams, std::string_view host, uint32 port)
+    {
+        if (datagrams.empty())
+            return;
+        PendingBatch batch{std::move(datagrams), std::string(host), port};
+        std::size_t const batchSize = batch.datagrams.size();
+        {
+            std::lock_guard<std::mutex> lock(_queueMutex);
+            if (batchSize <= STREAM_MAX_QUEUED_DATAGRAMS - _queuedDatagrams)
+            {
+                _pending.push_back(std::move(batch));
+                _queuedDatagrams += batchSize;
+                _hasPending = true;
+            }
+        }
+    }
+
+    // World thread after maps join; batches and socket operations stay outside locks.
+    void Flush()
+    {
+        if (!_hasPending)
+            return;
+        std::deque<PendingBatch> batches = TakePending();
+        for (PendingBatch const& batch : batches)
+            SendNow(batch.datagrams, batch.host, batch.port);
+    }
+
+    // Config reload must not send packets collected under the previous config.
+    void DiscardPending()
+    {
+        if (_hasPending)
+            TakePending().clear();
+    }
+
+private:
+    std::deque<PendingBatch> TakePending()
+    {
+        std::deque<PendingBatch> batches;
+        {
+            std::lock_guard<std::mutex> lock(_queueMutex);
+            batches.swap(_pending);
+            _queuedDatagrams = 0;
+            _hasPending = false;
+        }
+        return batches;
+    }
+
+    void SendNow(std::vector<std::vector<uint8>> const& datagrams, std::string_view host, uint32 port)
+    {
+        bool const destinationChanged = host != _host || port != _port;
+        uint64 const nowMs = GameTime::GetGameTimeMS().count();
+        if (!_socket && !destinationChanged && nowMs < _retryAtMs)
+            return;
+        if (!_socket || destinationChanged)
+        {
+            _retryAtMs = nowMs + STREAM_SENDER_RETRY_MS;
             Open(host, port);
+        }
         if (!_socket)
             return;
         for (std::vector<uint8> const& datagram : datagrams)
@@ -1362,12 +1578,16 @@ private:
         }
     }
 
-    std::mutex _mutex;
+    std::mutex _queueMutex;
+    std::deque<PendingBatch> _pending;
+    std::size_t _queuedDatagrams = 0;
+    std::atomic<bool> _hasPending = false;
     boost::asio::io_context _context;
     std::optional<boost::asio::ip::udp::socket> _socket;
     boost::asio::ip::udp::endpoint _endpoint;
     std::string _host;
     uint32 _port = 0;
+    uint64 _retryAtMs = 0;
 };
 
 StreamSender streamSender;
@@ -1453,7 +1673,7 @@ std::unordered_map<uint64, std::deque<TelemetryEvent>> eventHistory;
 void AddTelemetryEvent(Player* actor, std::string type, Unit const* target, uint32 valueId, std::string valueName,
                        uint32 amount)
 {
-    if (!actor || !actor->GetInstanceId())
+    if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) || !actor || !actor->GetInstanceId())
         return;
 
     TelemetryEvent event{actor->GetMapId(),
@@ -1558,9 +1778,12 @@ public:
             return false;
         }
 
-        uint64 const expiresAtMs = GameTime::GetGameTimeMS().count() + STREAM_SUBSCRIPTION_TTL_MS;
+        uint64 const nowMs = GameTime::GetGameTimeMS().count();
+        uint64 const expiresAtMs = nowMs + STREAM_SUBSCRIPTION_TTL_MS;
+        std::vector<std::shared_ptr<StreamSessionState>> expiredStates;
         {
             std::lock_guard<std::mutex> lock(streamStateMutex);
+            expiredStates = ExpireStreamSubscriptionsLocked(nowMs);
             uint64 const sessionKey = GetSessionKey(*mapId, *instanceId);
             auto const iterator = streamSubscriptions.find(sessionKey);
             if (iterator != streamSubscriptions.end())
@@ -1668,7 +1891,7 @@ public:
                                    target ? target->GetGUID().GetCounter() : 0,
                                    target ? target->GetTypeId() : TYPEID_OBJECT,
                                    target ? target->GetName() : "",
-                                   GetPlayerRole(player),
+                                   GetGroupRole(group, player->GetGUID()),
                                    player->HasAura(SPELL_WAITING_FOR_RESURRECT),
                                    battlegroundRole,
                                    wmoGroupId,
@@ -1811,12 +2034,11 @@ public:
 
     void OnMapUpdate(Map* map, uint32 diff) override
     {
-        if (!map->GetInstanceId())
+        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) || !map->GetInstanceId())
             return;
 
         uint64 const sessionKey = GetSessionKey(map->GetId(), map->GetInstanceId());
-        if (telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) &&
-            telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::StreamEnabled))
+        if (telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::StreamEnabled))
             StreamPositions(map, sessionKey, diff);
         {
             std::lock_guard<std::mutex> lock(telemetryStateMutex);
@@ -1847,7 +2069,7 @@ private:
             auto const iterator = streamSubscriptions.find(sessionKey);
             if (iterator == streamSubscriptions.end())
                 return;
-            if (iterator->second.expiresAtMs < nowMs)
+            if (iterator->second.expiresAtMs <= nowMs)
             {
                 streamSubscriptions.erase(iterator);
                 streamAnySubscribed = !streamSubscriptions.empty();
@@ -1862,6 +2084,13 @@ private:
             state = iterator->second.state;
         }
 
+        std::unordered_map<ObjectGuid, StreamPlayerGroup> groupSnapshots;
+        {
+            std::lock_guard<std::mutex> lock(state->groupMutex);
+            groupSnapshots = state->groups;
+        }
+        std::unordered_set<ObjectGuid> groupPlayers;
+        std::vector<ObjectGuid::LowType> groupIds;
         std::vector<StreamPlayer> players;
         std::vector<StreamPath> paths;
         std::vector<StreamBot> bots;
@@ -1874,6 +2103,13 @@ private:
             Player* player = playerReference.GetSource();
             if (!player || !player->IsInWorld())
                 continue;
+            ObjectGuid const playerGuid = player->GetGUID();
+            groupPlayers.insert(playerGuid);
+            auto const group = groupSnapshots.find(playerGuid);
+            uint8 const role = group != groupSnapshots.end() ? group->second.role : 0;
+            if (group != groupSnapshots.end() && group->second.groupId &&
+                std::find(groupIds.begin(), groupIds.end(), group->second.groupId) == groupIds.end())
+                groupIds.push_back(group->second.groupId);
             Powers const powerType = player->getPowerType();
             uint8 flags = 0;
             if (player->IsAlive())
@@ -1882,13 +2118,13 @@ private:
                 flags |= 2;
             if (player->HasAura(SPELL_WAITING_FOR_RESURRECT))
                 flags |= 4;
-            players.push_back({player->GetGUID().GetCounter(), player->GetPositionX(), player->GetPositionY(),
+            players.push_back({GetStreamUnitId(player->GetGUID()), player->GetPositionX(), player->GetPositionY(),
                                player->GetPositionZ(), player->GetOrientation(),
                                uint8(std::clamp(player->GetHealthPct(), 0.0f, 100.0f)),
                                uint8(std::clamp(player->GetPowerPct(powerType), 0.0f, 100.0f)), int8(powerType), flags,
-                               uint8(GetPlayerStateFlags(player)), GetPlayerRole(player),
-                               GetUnitWmoGroupId(map, player), player->GetName()});
-            CollectPathChange(player, player->GetGUID().GetCounter(), false, state->playerPaths, nowMs, paths);
+                               uint8(GetPlayerStateFlags(player)), role, GetUnitWmoGroupId(map, player),
+                               player->GetName()});
+            CollectPathChange(player, GetStreamUnitId(player->GetGUID()), false, state->playerPaths, nowMs, paths);
             CollectPassenger(player, passengers);
             CollectAppearance(player, *state, nowMs, appearances);
             CollectAuras(player, *state, nowMs, unitAuras);
@@ -1897,6 +2133,11 @@ private:
             if (player->GetSession() && player->GetSession()->IsHeadless())
                 CollectBot(map, player, *state, nowMs, bots);
 #endif
+        }
+        {
+            std::lock_guard<std::mutex> lock(state->groupMutex);
+            state->groupPlayers.swap(groupPlayers);
+            state->groupRefreshRequested = true;
         }
         // Forget players who have left, so a return is sent as new.
         for (auto iterator = state->playerPaths.begin(); iterator != state->playerPaths.end();)
@@ -1914,7 +2155,7 @@ private:
         std::vector<StreamCreature> creatures;
         CollectCreatures(map, *state, nowMs, creatures, paths, appearances, unitAuras, debuffs);
         std::vector<StreamMarker> markers;
-        bool const sendMarkers = CollectMarkers(map, *state, nowMs, markers);
+        bool const sendMarkers = CollectMarkers(groupIds, *state, nowMs, markers);
         std::vector<StreamGameObject> gameObjects;
         CollectGameObjects(map, *state, nowMs, gameObjects);
         // Forget units that have gone, so a return is sent as new.
@@ -2018,7 +2259,7 @@ private:
                                   std::vector<StreamAppearance>& appearances)
     {
         StreamAppearance appearance;
-        appearance.guid = unit->GetGUID().GetCounter();
+        appearance.guid = GetStreamUnitId(unit->GetGUID());
         appearance.displayId = unit->GetDisplayId();
         appearance.nativeDisplayId = unit->GetNativeDisplayId();
         appearance.mountDisplayId = unit->GetMountID();
@@ -2157,7 +2398,7 @@ private:
                 flags |= 4;
         }
         passengers.push_back(
-            {player->GetGUID().GetCounter(), base->GetGUID().GetCounter(), flags, player->GetTransSeat()});
+            {GetStreamUnitId(player->GetGUID()), GetStreamUnitId(base->GetGUID()), flags, player->GetTransSeat()});
     }
 
     // Adds the unit's harmful auras to `units` when the list changed (spells or
@@ -2165,7 +2406,7 @@ private:
     static void CollectDebuffs(Unit* unit, StreamSessionState& state, uint64 nowMs,
                                std::vector<StreamUnitDebuffs>& units)
     {
-        StreamUnitDebuffs entry{unit->GetGUID().GetCounter(), !unit->IsPlayer(), {}};
+        StreamUnitDebuffs entry{GetStreamUnitId(unit->GetGUID()), !unit->IsPlayer(), {}};
         std::size_t signature = 0;
         for (auto const& [spellId, application] : unit->GetAppliedAuras())
         {
@@ -2199,14 +2440,9 @@ private:
 
     // Fills `markers` with the raid markers the session's groups have set;
     // true when they should be sent (changed, or due a refresh while any are).
-    static bool CollectMarkers(Map* map, StreamSessionState& state, uint64 nowMs, std::vector<StreamMarker>& markers)
+    static bool CollectMarkers(std::vector<ObjectGuid::LowType> const& groupIds, StreamSessionState& state,
+                               uint64 nowMs, std::vector<StreamMarker>& markers)
     {
-        std::vector<ObjectGuid::LowType> groupIds;
-        for (auto const& playerReference : map->GetPlayers())
-            if (Player* player = playerReference.GetSource())
-                if (Group* group = player->GetGroup())
-                    if (std::find(groupIds.begin(), groupIds.end(), group->GetGUID().GetCounter()) == groupIds.end())
-                        groupIds.push_back(group->GetGUID().GetCounter());
         std::size_t signature = 0;
         for (GroupMarkers const& groupMarkers : GetGroupMarkers(groupIds, nowMs))
         {
@@ -2215,12 +2451,16 @@ private:
                 ObjectGuid const target = groupMarkers[icon];
                 if (!target)
                     continue;
-                bool const duplicate =
-                    std::any_of(markers.begin(), markers.end(), [&](StreamMarker const& marker)
-                                { return marker.icon == icon && marker.guid == target.GetCounter(); });
+                bool const duplicate = std::any_of(markers.begin(), markers.end(),
+                                                   [&](StreamMarker const& marker)
+                                                   {
+                                                       return marker.icon == icon &&
+                                                              marker.creature == !target.IsPlayer() &&
+                                                              marker.guid == GetStreamUnitId(target);
+                                                   });
                 if (duplicate)
                     continue;
-                markers.push_back({icon, !target.IsPlayer(), target.GetCounter()});
+                markers.push_back({icon, !target.IsPlayer(), GetStreamUnitId(target)});
                 MixSignature(signature, target.GetRawValue() + icon);
             }
         }
@@ -2238,7 +2478,7 @@ private:
     static void CollectAuras(Unit* unit, StreamSessionState& state, uint64 nowMs,
                              std::vector<StreamUnitAuras>& unitAuras)
     {
-        StreamUnitAuras auras{unit->GetGUID().GetCounter(), !unit->IsPlayer(), {}};
+        StreamUnitAuras auras{GetStreamUnitId(unit->GetGUID()), !unit->IsPlayer(), {}};
         for (auto const& [spellId, application] : unit->GetAppliedAuras())
         {
             if (auras.spellIds.size() >= STREAM_MAX_UNIT_AURAS)
@@ -2282,7 +2522,7 @@ private:
         AiObjectContext* context = botAI ? botAI->GetAiObjectContext() : nullptr;
         if (!context)
             return;
-        uint32 const guid = player->GetGUID().GetCounter();
+        uint32 const guid = GetStreamUnitId(player->GetGUID());
         std::shared_ptr<BotActionLog> const log = TrackBotActions(guid, botAI->GetCurrentEngine());
         auto [iterator, inserted] = state.bots.try_emplace(guid);
         StreamSessionState::SentSignature& sent = iterator->second;
@@ -2300,13 +2540,13 @@ private:
             if (auto const* follower = dynamic_cast<AbstractFollower const*>(motionMaster->top()))
                 if (Unit* target = follower->GetTarget())
                 {
-                    bot.motionTargetGuid = target->GetGUID().GetCounter();
+                    bot.motionTargetGuid = GetStreamUnitId(target->GetGUID());
                     if (target->IsPlayer())
                         bot.flags |= 2;
                 }
         }
         ObjectGuid const target = player->GetTarget();
-        bot.targetGuid = target ? target.GetCounter() : 0;
+        bot.targetGuid = GetStreamUnitId(target);
         if (target.IsPlayer())
             bot.flags |= 4;
         uint32 moveSetAt = 0;
@@ -2408,7 +2648,7 @@ private:
             if (!creature->IsInWorld() || creature->IsDuringRemoveFromWorld() || creature->IsTrigger() ||
                 creature->IsTotem() || creature->IsCritter())
                 continue;
-            uint32 const guid = creature->GetGUID().GetCounter();
+            uint32 const guid = GetStreamUnitId(creature->GetGUID());
             seen.insert(guid);
 
             ObjectGuid const target = creature->GetTarget();
@@ -2428,7 +2668,7 @@ private:
             bool const scenery = IsScenery(creature);
             if (scenery)
                 flags |= 64;
-            uint32 const targetGuid = target ? target.GetCounter() : 0;
+            uint32 const targetGuid = GetStreamUnitId(target);
             uint8 const healthPct = uint8(std::clamp(creature->GetHealthPct(), 0.0f, 100.0f));
 
             auto [iterator, inserted] = state.creatures.try_emplace(guid);
@@ -2573,23 +2813,26 @@ private:
 
 // ── Combat events ────────────────────────────────────────────
 
-// Queues a combat event for the stream of the session the unit is in, if
-// anyone is watching it.
-void RecordCombatEvent(Unit const* unit, StreamCombatEvent const& event)
+// Resolve an active local subscription before inspecting spells or building events.
+std::shared_ptr<StreamSessionState> FindCombatStream(Unit const* unit)
 {
     if (!streamAnySubscribed || !unit || !unit->IsInWorld())
-        return;
+        return {};
     Map* map = unit->GetMap();
     if (!map || !map->GetInstanceId())
+        return {};
+    uint64 const nowMs = GameTime::GetGameTimeMS().count();
+    std::lock_guard<std::mutex> lock(streamStateMutex);
+    auto const iterator = streamSubscriptions.find(GetSessionKey(map->GetId(), map->GetInstanceId()));
+    if (iterator == streamSubscriptions.end() || iterator->second.expiresAtMs <= nowMs)
+        return {};
+    return iterator->second.state;
+}
+
+void RecordCombatEvent(std::shared_ptr<StreamSessionState> const& state, StreamCombatEvent const& event)
+{
+    if (!state)
         return;
-    std::shared_ptr<StreamSessionState> state;
-    {
-        std::lock_guard<std::mutex> lock(streamStateMutex);
-        auto const iterator = streamSubscriptions.find(GetSessionKey(map->GetId(), map->GetInstanceId()));
-        if (iterator == streamSubscriptions.end())
-            return;
-        state = iterator->second.state;
-    }
     std::lock_guard<std::mutex> lock(state->eventMutex);
     if (state->events.size() >= STREAM_MAX_EVENTS)
     {
@@ -2602,14 +2845,14 @@ void RecordCombatEvent(Unit const* unit, StreamCombatEvent const& event)
 
 void SetEventSource(StreamCombatEvent& event, ObjectGuid guid)
 {
-    event.sourceGuid = guid.GetCounter();
+    event.sourceGuid = GetStreamUnitId(guid);
     if (guid && !guid.IsPlayer())
         event.flags |= STREAM_EVENT_SOURCE_CREATURE;
 }
 
 void SetEventTarget(StreamCombatEvent& event, ObjectGuid guid)
 {
-    event.targetGuid = guid.GetCounter();
+    event.targetGuid = GetStreamUnitId(guid);
     if (guid && !guid.IsPlayer())
         event.flags |= STREAM_EVENT_TARGET_CREATURE;
 }
@@ -2736,6 +2979,7 @@ struct PendingSpellAmount
     ObjectGuid target;
     SpellInfo const* spellInfo = nullptr;
     bool periodic = false;
+    uint64 sessionKey = 0;
 };
 
 ObjectGuid GuidOf(Unit const* unit) { return unit ? unit->GetGUID() : ObjectGuid::Empty; }
@@ -2748,6 +2992,7 @@ struct LastSwing
 {
     ObjectGuid attacker;
     ObjectGuid target;
+    uint64 sessionKey = 0;
     uint64 atMs = 0;
 };
 
@@ -2765,32 +3010,39 @@ public:
     // Instant spells have already fired by the time this runs.
     void OnSpellPrepare(Spell* spell, Unit* caster, SpellInfo const* spellInfo) override
     {
-        if (!streamAnySubscribed || !spell || !caster || !spellInfo || spellInfo->IsPassive() ||
-            spellInfo->IsChanneled() || spell->GetCastTime() <= 0)
+        if (!spell || !caster || !spellInfo)
+            return;
+        auto const state = FindCombatStream(caster);
+        if (!state || spellInfo->IsPassive() || spellInfo->IsChanneled() || spell->GetCastTime() <= 0)
             return;
         StreamCombatEvent event = MakeCastEvent(STREAM_EVENT_CAST_START, spell, caster, spellInfo);
         event.value = uint32(spell->GetCastTime());
-        RecordCombatEvent(caster, event);
+        RecordCombatEvent(state, event);
     }
 
     void OnSpellCast(Spell* spell, Unit* caster, SpellInfo const* spellInfo, bool /*skipCheck*/) override
     {
-        if (!streamAnySubscribed || !spell || !caster || !spellInfo || spellInfo->IsPassive())
+        if (!spell || !caster || !spellInfo)
+            return;
+        auto const state = FindCombatStream(caster);
+        if (!state || spellInfo->IsPassive())
             return;
         StreamCombatEvent event = MakeCastEvent(STREAM_EVENT_CAST_GO, spell, caster, spellInfo);
         if (spellInfo->HasEffect(SPELL_EFFECT_PERSISTENT_AREA_AURA))
             event.extraFlags |= STREAM_EVENT_PERSISTENT_AREA;
         if (spellInfo->IsChanneled() || (event.extraFlags & STREAM_EVENT_PERSISTENT_AREA))
             event.value = uint32(std::max(0, spellInfo->GetMaxDuration()));
-        RecordCombatEvent(caster, event);
+        RecordCombatEvent(state, event);
     }
 
     void OnSpellCastCancel(Spell* spell, Unit* caster, SpellInfo const* spellInfo, bool /*bySelf*/) override
     {
-        if (!streamAnySubscribed || !spell || !caster || !spellInfo ||
-            (spell->GetCastTime() <= 0 && !spellInfo->IsChanneled()))
+        if (!spell || !caster || !spellInfo)
             return;
-        RecordCombatEvent(caster, MakeCastEvent(STREAM_EVENT_CAST_CANCEL, spell, caster, spellInfo));
+        auto const state = FindCombatStream(caster);
+        if (!state || (spell->GetCastTime() <= 0 && !spellInfo->IsChanneled()))
+            return;
+        RecordCombatEvent(state, MakeCastEvent(STREAM_EVENT_CAST_CANCEL, spell, caster, spellInfo));
     }
 };
 
@@ -2810,45 +3062,58 @@ public:
     // count too.
     void ModifyMeleeDamage(Unit* target, Unit* attacker, uint32& /*damage*/) override
     {
-        if (!streamAnySubscribed || !target || !attacker)
+        if (!target || !attacker)
+            return;
+        auto const state = FindCombatStream(attacker);
+        if (!state)
             return;
         uint64 const nowMs = GameTime::GetGameTimeMS().count();
+        uint64 const sessionKey = GetSessionKey(attacker->GetMapId(), attacker->GetInstanceId());
         if (lastSwing.attacker == attacker->GetGUID() && lastSwing.target == target->GetGUID() &&
-            lastSwing.atMs == nowMs)
+            lastSwing.sessionKey == sessionKey && lastSwing.atMs == nowMs)
             return;
-        lastSwing = {attacker->GetGUID(), target->GetGUID(), nowMs};
+        lastSwing = {attacker->GetGUID(), target->GetGUID(), sessionKey, nowMs};
         StreamCombatEvent event = MakeUnitEvent(STREAM_EVENT_SWING, attacker, target);
         event.schoolMask = SPELL_SCHOOL_MASK_NORMAL;
-        RecordCombatEvent(attacker, event);
+        RecordCombatEvent(state, event);
     }
 
     void ModifySpellDamageTaken(Unit* target, Unit* attacker, int32& /*damage*/, SpellInfo const* spellInfo) override
     {
-        if (streamAnySubscribed)
-            pendingDamage = {GuidOf(attacker), GuidOf(target), spellInfo, false};
+        pendingDamage = {};
+        if (FindCombatStream(target))
+            pendingDamage = {GuidOf(attacker), GuidOf(target), spellInfo, false,
+                             GetSessionKey(target->GetMapId(), target->GetInstanceId())};
     }
 
     void ModifyPeriodicDamageAurasTick(Unit* target, Unit* attacker, uint32& /*damage*/,
                                        SpellInfo const* spellInfo) override
     {
-        if (streamAnySubscribed)
-            pendingDamage = {GuidOf(attacker), GuidOf(target), spellInfo, true};
+        pendingDamage = {};
+        if (FindCombatStream(target))
+            pendingDamage = {GuidOf(attacker), GuidOf(target), spellInfo, true,
+                             GetSessionKey(target->GetMapId(), target->GetInstanceId())};
     }
 
     // The final amount, after armour, resistances, and absorbs.
     uint32 DealDamage(Unit* attacker, Unit* victim, uint32 damage, DamageEffectType damageType) override
     {
-        if (!streamAnySubscribed || !victim || !damage ||
+        auto const state = FindCombatStream(victim);
+        if (!state || !damage ||
             (damageType != DIRECT_DAMAGE && damageType != SPELL_DIRECT_DAMAGE && damageType != DOT))
+        {
+            pendingDamage = {};
             return damage;
+        }
         StreamCombatEvent event = MakeUnitEvent(STREAM_EVENT_DAMAGE, attacker, victim);
         event.value = damage;
         if (damageType == DOT)
             event.flags |= STREAM_EVENT_PERIODIC;
         if (damageType == DIRECT_DAMAGE)
             event.schoolMask = SPELL_SCHOOL_MASK_NORMAL;
-        else if (pendingDamage.spellInfo && pendingDamage.source == GuidOf(attacker) &&
-                 pendingDamage.target == victim->GetGUID())
+        else if (pendingDamage.spellInfo &&
+                 pendingDamage.sessionKey == GetSessionKey(victim->GetMapId(), victim->GetInstanceId()) &&
+                 pendingDamage.source == GuidOf(attacker) && pendingDamage.target == victim->GetGUID())
         {
             event.spellId = pendingDamage.spellInfo->Id;
             event.schoolMask = uint8(pendingDamage.spellInfo->SchoolMask);
@@ -2856,7 +3121,7 @@ public:
                 event.flags |= STREAM_EVENT_PERIODIC;
         }
         pendingDamage = {};
-        RecordCombatEvent(victim, event);
+        RecordCombatEvent(state, event);
         return damage;
     }
 
@@ -2864,18 +3129,35 @@ public:
     // the path, so OnHeal matches them either way round.
     void ModifyHealReceived(Unit* target, Unit* healer, uint32& /*heal*/, SpellInfo const* spellInfo) override
     {
-        if (!streamAnySubscribed)
+        Unit* sessionUnit = target;
+        auto state = FindCombatStream(target);
+        if (!state)
+        {
+            sessionUnit = healer;
+            state = FindCombatStream(healer);
+        }
+        if (!state)
+        {
+            pendingHeal = {};
+            pendingDamage = {};
             return;
-        bool const periodic = pendingDamage.periodic && pendingDamage.spellInfo == spellInfo;
-        pendingHeal = {GuidOf(healer), GuidOf(target), spellInfo, periodic};
+        }
+        uint64 const sessionKey = GetSessionKey(sessionUnit->GetMapId(), sessionUnit->GetInstanceId());
+        bool const periodic =
+            pendingDamage.periodic && pendingDamage.spellInfo == spellInfo && pendingDamage.sessionKey == sessionKey;
+        pendingHeal = {GuidOf(healer), GuidOf(target), spellInfo, periodic, sessionKey};
         pendingDamage = {};
     }
 
     // The amount actually healed, without overhealing.
     void OnHeal(Unit* healer, Unit* receiver, uint32& gain) override
     {
-        if (!streamAnySubscribed || !receiver || !gain)
+        auto const state = FindCombatStream(receiver);
+        if (!state || !gain)
+        {
+            pendingHeal = {};
             return;
+        }
         StreamCombatEvent event = MakeUnitEvent(STREAM_EVENT_HEAL, healer, receiver);
         event.value = gain;
         event.flags |= STREAM_EVENT_HELPFUL;
@@ -2883,7 +3165,8 @@ public:
         ObjectGuid const receiverGuid = receiver->GetGUID();
         bool const matches = (pendingHeal.source == healerGuid && pendingHeal.target == receiverGuid) ||
                              (pendingHeal.source == receiverGuid && pendingHeal.target == healerGuid);
-        if (pendingHeal.spellInfo && matches)
+        if (pendingHeal.spellInfo && matches &&
+            pendingHeal.sessionKey == GetSessionKey(receiver->GetMapId(), receiver->GetInstanceId()))
         {
             event.spellId = pendingHeal.spellInfo->Id;
             event.schoolMask = uint8(pendingHeal.spellInfo->SchoolMask);
@@ -2891,25 +3174,31 @@ public:
                 event.flags |= STREAM_EVENT_PERIODIC;
         }
         pendingHeal = {};
-        RecordCombatEvent(receiver, event);
+        RecordCombatEvent(state, event);
     }
 
     void OnAuraApply(Unit* unit, Aura* aura) override
     {
-        if (!streamAnySubscribed || !unit || !aura)
+        if (!unit || !aura)
             return;
-        RecordAura(STREAM_EVENT_AURA_APPLY, unit, aura);
+        auto const state = FindCombatStream(unit);
+        if (!state)
+            return;
+        RecordAura(STREAM_EVENT_AURA_APPLY, unit, aura, state);
     }
 
     void OnAuraRemove(Unit* unit, AuraApplication* application, AuraRemoveMode /*mode*/) override
     {
-        if (!streamAnySubscribed || !unit || !application || !application->GetBase())
+        if (!unit || !application)
             return;
-        RecordAura(STREAM_EVENT_AURA_REMOVE, unit, application->GetBase());
+        auto const state = FindCombatStream(unit);
+        if (!state || !application->GetBase())
+            return;
+        RecordAura(STREAM_EVENT_AURA_REMOVE, unit, application->GetBase(), state);
     }
 
 private:
-    static void RecordAura(uint8 kind, Unit* unit, Aura const* aura)
+    static void RecordAura(uint8 kind, Unit* unit, Aura const* aura, std::shared_ptr<StreamSessionState> const& state)
     {
         SpellInfo const* spellInfo = aura->GetSpellInfo();
         uint8 const category = ClassifyAura(spellInfo);
@@ -2926,7 +3215,7 @@ private:
             event.flags |= STREAM_EVENT_HELPFUL;
         if (kind == STREAM_EVENT_AURA_APPLY)
             event.value = uint32(std::max(0, aura->GetDuration()));
-        RecordCombatEvent(unit, event);
+        RecordCombatEvent(state, event);
     }
 };
 
@@ -2940,7 +3229,8 @@ public:
 
     void OnBattlegroundEnd(Battleground* battleground, TeamId /*winnerTeam*/) override
     {
-        if (!battleground || !battleground->GetInstanceID())
+        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) || !battleground ||
+            !battleground->GetInstanceID())
             return;
 
         wowmin_telemetry_mapscript::CaptureBattleground(
@@ -2955,7 +3245,7 @@ public:
 
     void OnUnitDeath(Unit* unit, Unit* killer) override
     {
-        if (!unit)
+        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) || !unit)
             return;
 
         Player* killerPlayer = killer ? killer->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
@@ -2993,23 +3283,26 @@ public:
 
     void OnPlayerLogout(Player* player) override
     {
+        if (!player)
+            return;
+        ForgetStreamPlayerGroups(player->GetGUID());
 #ifdef MOD_PLAYERBOTS
-        if (player)
-            ForgetBotActions(player->GetGUID().GetCounter());
-#else
-        (void)player;
+        ForgetBotActions(player->GetGUID().GetCounter());
 #endif
     }
 
     void OnPlayerLevelChanged(Player* player, uint8 oldLevel) override
     {
+        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled))
+            return;
         if (player && player->GetLevel() > oldLevel)
             AddTelemetryEvent(player, "level", nullptr, player->GetLevel(), "", oldLevel);
     }
 
     void OnPlayerStoreNewItem(Player* player, Item* item, uint32 /*count*/) override
     {
-        if (!player || !item || !player->GetInstanceId())
+        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) || !player || !item ||
+            !player->GetInstanceId())
             return;
 
         uint32 itemEntry = item->GetEntry();
@@ -3022,7 +3315,8 @@ public:
 
     void OnPlayerLootItem(Player* player, Item* item, uint32 count, ObjectGuid /*lootGuid*/) override
     {
-        if (!player || !item || !player->GetInstanceId())
+        if (!telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) || !player || !item ||
+            !player->GetInstanceId())
             return;
 
         uint64 playerGuid = player->GetGUID().GetCounter();
@@ -3062,14 +3356,59 @@ public:
     {
     }
 
-    void OnBeforeConfigLoad(bool reload) override { telemetryConfig.Initialize(reload); }
+    void OnBeforeConfigLoad(bool reload) override
+    {
+        streamSender.DiscardPending();
+        telemetryConfig.Initialize(reload);
+        if (telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::Enabled) &&
+            telemetryConfig.GetConfigValue<bool>(WowMinTelemetryConfig::StreamEnabled))
+            return;
+
+        // Retire owned caches outside their locks; text histories stay intact.
+        decltype(streamSubscriptions) retiredSubscriptions;
+        {
+            std::lock_guard<std::mutex> lock(streamStateMutex);
+            retiredSubscriptions.swap(streamSubscriptions);
+            streamAnySubscribed = false;
+        }
+        decltype(groupMarkers) retiredMarkers;
+        {
+            std::lock_guard<std::mutex> lock(groupMarkersMutex);
+            retiredMarkers.swap(groupMarkers);
+        }
+#ifdef MOD_PLAYERBOTS
+        RetireUnobservedBotActions();
+#endif
+    }
 
     // Runs after every map has finished its update (World::Update), so no map
     // thread is setting raid markers while they are copied.
     void OnUpdate(uint32 /*diff*/) override
     {
+        if (!streamAnySubscribed)
+        {
+#ifdef MOD_PLAYERBOTS
+            RetireUnobservedBotActions();
+#endif
+            streamSender.Flush();
+            return;
+        }
+        uint64 const nowMs = GameTime::GetGameTimeMS().count();
+        std::vector<std::shared_ptr<StreamSessionState>> expiredStates;
+        {
+            std::lock_guard<std::mutex> lock(streamStateMutex);
+            expiredStates = ExpireStreamSubscriptionsLocked(nowMs);
+        }
+        expiredStates.clear();
+#ifdef MOD_PLAYERBOTS
+        RetireUnobservedBotActions();
+#endif
         if (streamAnySubscribed)
-            CopyGroupMarkers(GameTime::GetGameTimeMS().count());
+        {
+            CopyStreamPlayerGroups();
+            CopyGroupMarkers(nowMs);
+        }
+        streamSender.Flush();
     }
 };
 }  // namespace

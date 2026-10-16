@@ -1,9 +1,16 @@
+#
+#Keep these
+#
 !.gitignore
+!.coderabbit.yaml
+!.agents/
+!AGENTS.md
+!CLAUDE.md
+!.pi/APPEND_SYSTEM.md
 
 #
 #Generic
 #
-
 .directory
 .mailmap
 *.orig
@@ -30,7 +37,9 @@ CMakeLists.txt.user
 nbproject/
 .sync.ffs_db
 *.kate-swp
-.pi/
+.agents/plans/
+.pi/rpac
+
 #
 # Eclipse
 #
